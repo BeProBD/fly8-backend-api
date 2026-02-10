@@ -2169,4 +2169,17 @@ router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent'), a
   }
 });
 
+// ===========================================
+// COURSE & PROGRAM DISCOVERY
+// ===========================================
+
+const agentCourseController = require('../controllers/agentCourseController');
+
+router.get('/courses/search', authMiddleware, roleMiddleware('agent'), agentCourseController.searchPrograms);
+router.get('/courses/filters', authMiddleware, roleMiddleware('agent'), agentCourseController.getFilterOptions);
+router.get('/courses/shortlists', authMiddleware, roleMiddleware('agent'), agentCourseController.getShortlists);
+router.post('/courses/shortlist', authMiddleware, roleMiddleware('agent'), agentCourseController.addToShortlist);
+router.delete('/courses/shortlist/:shortlistId', authMiddleware, roleMiddleware('agent'), agentCourseController.removeFromShortlist);
+router.get('/courses/:id', authMiddleware, roleMiddleware('agent'), agentCourseController.getProgramDetail);
+
 module.exports = router;

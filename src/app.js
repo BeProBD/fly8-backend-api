@@ -47,17 +47,12 @@ cloudinaryConnect();
 // =============================================================================
 const allowedOrigins = [
   // Production domains
-  'https://fly8.com',
-  'https://www.fly8.com',
-  'https://app.fly8.com',
-  'https://api.fly8.com',
-  'https://dashboards.fly8.global',
-  'https://fly8.global',
   'https://www.fly8.global',
+  'https://app.fly8.global',
   // Vercel deployments
-  'https://fly8-client.vercel.app',
-  'https://fly8-dashboard-client.vercel.app',
-  'https://fly8-marketing.vercel.app',
+  'https://fly8-marketing-frontend.vercel.app',
+  'https://fly8-dashboard-frontend.vercel.app',
+
   // Development
   'http://localhost:3000',
   'http://localhost:3001',
