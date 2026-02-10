@@ -1,0 +1,64 @@
+# Fly8 Dashboard - Docker Compose Development Configuration
+# Usage: docker-compose -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  # MongoDB (for local development)
+  mongodb:
+    image: mongo:7
+    container_name: fly8-mongodb-dev
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - fly8-dev-network
+
+  # Backend API (development)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fly8-backend-dev
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - NODE_ENV=development
+      - PORT=8001
+      - MONGO_URL=mongodb://mongodb:27017
+      - DB_NAME=fly8_dashboard_dev
+      - JWT_SECRET=dev-secret-key-for-testing-only-min-32-chars
+      - CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - mongodb
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - fly8-dev-network
+
+  # Frontend (development)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fly8-frontend-dev
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    environment:
+      - REACT_APP_BACKEND_URL=http://localhost:8001
+    depends_on:
+      - backend
+    networks:
+      - fly8-dev-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  fly8-dev-network:
+    driver: bridge

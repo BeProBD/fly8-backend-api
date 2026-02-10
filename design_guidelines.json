@@ -1,0 +1,161 @@
+{
+  "brand_identity": {
+    "name": "Fly8",
+    "tagline": "Your Launchpad to Global Education",
+    "tone": "Vibrant, Energetic, Optimistic, Clear",
+    "archetype": "The Guide (Heroic & Supportive)",
+    "visual_style": "Progress Spectrum"
+  },
+  "typography": {
+    "headings": {
+      "family": "Outfit, sans-serif",
+      "weights": ["500", "600", "700"],
+      "usage": "All section headers, modal titles, and hero text. Use tight tracking (-0.02em) for sizes over 24px."
+    },
+    "body": {
+      "family": "Plus Jakarta Sans, sans-serif",
+      "weights": ["400", "500", "600"],
+      "usage": "General text, labels, inputs, and data tables."
+    },
+    "mono": {
+      "family": "JetBrains Mono, monospace",
+      "usage": "Application IDs, tracking numbers, and technical data."
+    }
+  },
+  "colors": {
+    "primary": {
+      "DEFAULT": "#4F46E5",
+      "foreground": "#FFFFFF",
+      "hover": "#4338CA"
+    },
+    "secondary": {
+      "DEFAULT": "#F1F5F9",
+      "foreground": "#0F172A"
+    },
+    "background": "#F8FAFC",
+    "surface": "#FFFFFF",
+    "journey_spectrum": {
+      "step_1_profile": "#3B82F6",
+      "step_2_preapp": "#8B5CF6",
+      "step_3_apply": "#A855F7",
+      "step_4_visa": "#EC4899",
+      "step_5_ticket": "#F97316",
+      "step_6_accom": "#F59E0B",
+      "step_7_loan": "#10B981",
+      "step_8_jobs": "#14B8A6"
+    },
+    "semantic": {
+      "success": "#10B981",
+      "warning": "#F59E0B",
+      "error": "#EF4444",
+      "info": "#3B82F6"
+    }
+  },
+  "visual_enhancers": {
+    "border_radius": {
+      "cards": "1rem",
+      "buttons": "9999px",
+      "inputs": "0.75rem"
+    },
+    "shadows": {
+      "card": "0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)",
+      "hover": "0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -2px rgba(0, 0, 0, 0.04)",
+      "glow": "0 0 20px rgba(79, 70, 229, 0.15)"
+    },
+    "textures": "Use subtle noise overlays on solid color backgrounds to reduce digital flatness."
+  },
+  "layout_strategies": {
+    "student_dashboard": {
+      "type": "Tetris Grid",
+      "structure": "grid-cols-1 md:grid-cols-12 gap-6",
+      "areas": {
+        "timeline": "col-span-full",
+        "current_action": "col-span-12 md:col-span-8 row-span-2",
+        "notifications": "col-span-12 md:col-span-4 row-span-1",
+        "counselor": "col-span-12 md:col-span-4 row-span-1"
+      }
+    },
+    "admin_dashboard": {
+      "type": "Control Room Grid",
+      "structure": "grid-cols-1 md:grid-cols-4 gap-4",
+      "areas": {
+        "stats": "col-span-1",
+        "main_table": "col-span-full md:col-span-3 row-span-2",
+        "activity_feed": "col-span-1 row-span-2"
+      }
+    }
+  },
+  "components": {
+    "JourneyRail": {
+      "description": "A horizontal scrollable timeline component representing the 8 steps.",
+      "features": [
+        "Horizontal scroll with snap behavior",
+        "Progress bar connecting steps",
+        "Active step is expanded and colored",
+        "Completed steps have checkmarks",
+        "Locked steps are desaturated"
+      ],
+      "path": "src/components/dashboard/JourneyRail.jsx"
+    },
+    "ServiceCard": {
+      "description": "Card component for individual services in the catalog.",
+      "features": ["Icon header", "Price/Status badge", "Hover lift effect"],
+      "path": "src/components/dashboard/ServiceCard.jsx"
+    },
+    "StatsWidget": {
+      "description": "Minimalist stat card for admin dashboards.",
+      "features": ["Trend indicator (up/down)", "Sparkline chart (optional)", "Icon background"],
+      "path": "src/components/dashboard/StatsWidget.jsx"
+    }
+  },
+  "image_urls": {
+    "student_hero": {
+      "url": "https://images.unsplash.com/photo-1758270705902-f50dde4add9f?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "alt": "Diverse group of happy students taking a selfie",
+      "usage": "Login page hero, Student Dashboard welcome banner"
+    },
+    "counselor_avatar": {
+      "url": "https://images.unsplash.com/photo-1674916974247-64a74f1ee042?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "alt": "Professional counselor with headphones",
+      "usage": "Counselor profile, Chat widget avatar"
+    },
+    "visa_icon": {
+      "url": "https://images.unsplash.com/photo-1721138942121-a26751b520b5?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "alt": "Passport and visa documents",
+      "usage": "Visa Support service card background"
+    }
+  },
+  "icons": {
+    "library": "lucide-react",
+    "mapping": {
+      "Profile Assessment": "UserCircle",
+      "Pre-application": "FileText",
+      "Apply University": "School",
+      "Visa Support": "Stamp",
+      "Ticket & Travel": "Plane",
+      "Accommodation": "Home",
+      "Education Loan": "Banknote",
+      "Find Jobs": "Briefcase"
+    }
+  },
+  "instructions_to_main_agent": [
+    "1. SETUP: Install 'lucide-react' and 'recharts' immediately.",
+    "2. THEME: Update tailwind.config.js to include the 'journey_spectrum' colors as custom utilities (e.g., 'bg-journey-profile', 'text-journey-visa').",
+    "3. TIMELINE: Build the 'JourneyRail' component first. It is the core USP. It must be responsive (horizontal scroll on mobile).",
+    "4. DASHBOARDS: Create separate layouts for Student (Playful/Tetris) vs Admin (Dense/Control Room). Do not reuse the same layout wrapper.",
+    "5. BACKEND: Ensure all API calls are mocked or pointed to the new Express endpoints. The frontend must handle loading states gracefully.",
+    "6. ANIMATION: Use 'framer-motion' for the timeline progress bar filling up. It adds a sense of accomplishment."
+  ],
+  "universal_guidelines": {
+    "do_not": [
+      "Use generic 'Inter' for headings.",
+      "Use default blue for everything.",
+      "Create boring equal-width grids for the student dashboard."
+    ],
+    "must_do": [
+      "Use the 'Outfit' font for a friendly vibe.",
+      "Make the 'Journey Timeline' the most prominent element on the student dashboard.",
+      "Use the specific image URLs provided for avatars and hero sections."
+    ]
+  }
+}
