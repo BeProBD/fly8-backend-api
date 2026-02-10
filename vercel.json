@@ -1,12 +1,5 @@
 {
   "version": 2,
-  "installCommand": "npm install",
-  "functions": {
-    "src/app.js": {
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  },
   "builds": [
     {
       "src": "src/app.js",
@@ -14,18 +7,6 @@
     }
   ],
   "routes": [
-    {
-      "src": "/socket.io/(.*)",
-      "dest": "src/app.js"
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "src/app.js"
-    },
-    {
-      "src": "/(health|ready|live)",
-      "dest": "src/app.js"
-    },
     {
       "src": "/(.*)",
       "dest": "src/app.js"

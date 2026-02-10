@@ -17,19 +17,27 @@ const http = require('http');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 const fileUpload = require('express-fileupload');
-const { initSocket } = require('./socket/socketManager');
 const { cloudinaryConnect } = require('./config/cloudinary');
 const { ensureSuperAdminExists } = require('./scripts/seedSuperAdmin');
 
-// Load environment variables
-dotenv.config({ path: path.join(__dirname, '..', '.env') });
+const IS_VERCEL = process.env.VERCEL === '1';
+
+// Load environment variables (skip on Vercel - env vars are injected via dashboard)
+if (!IS_VERCEL) {
+  dotenv.config({ path: path.join(__dirname, '..', '.env') });
+}
 
 const app = express();
-const server = http.createServer(app);
 const PORT = process.env.PORT || 8001;
 
-// Initialize Socket.io
-initSocket(server);
+// Only create HTTP server and Socket.io in non-serverless environments
+// Vercel is stateless — WebSockets/Socket.io cannot work there
+let server;
+if (!IS_VERCEL) {
+  const { initSocket } = require('./socket/socketManager');
+  server = http.createServer(app);
+  initSocket(server);
+}
 
 // Initialize Cloudinary
 cloudinaryConnect();
@@ -78,7 +86,12 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'X-Requested-With'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Cookie',
+    'X-Requested-With',
+  ],
   exposedHeaders: ['Set-Cookie'],
   maxAge: 86400, // 24 hours preflight cache
 };
@@ -107,7 +120,7 @@ const apiLimiter = rateLimit({
   max: 100, // 100 requests per minute for general API
   message: {
     success: false,
-    error: 'Too many requests. Please slow down.'
+    error: 'Too many requests. Please slow down.',
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -118,7 +131,7 @@ const publicLimiter = rateLimit({
   max: 200, // Higher limit for public/marketing endpoints
   message: {
     success: false,
-    error: 'Too many requests. Please slow down.'
+    error: 'Too many requests. Please slow down.',
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -134,13 +147,16 @@ app.use(cookieParser());
 // File upload middleware - conditional for blog routes (they use multer)
 app.use((req, res, next) => {
   // Skip for blog routes that use multer
-  if (req.path.startsWith('/api/v1/public/blogs') || req.path.startsWith('/api/v1/admin/blogs')) {
+  if (
+    req.path.startsWith('/api/v1/public/blogs') ||
+    req.path.startsWith('/api/v1/admin/blogs')
+  ) {
     return next();
   }
 
   fileUpload({
-    useTempFiles: true,
-    tempFileDir: '/tmp/',
+    useTempFiles: !IS_VERCEL,
+    tempFileDir: IS_VERCEL ? undefined : '/tmp/',
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
     abortOnLimit: true,
     createParentPath: true,
@@ -156,7 +172,10 @@ app.use('/api', apiLimiter);
 // =============================================================================
 // DATABASE CONNECTION (SINGLE UNIFIED DATABASE)
 // =============================================================================
-const MONGO_URL = process.env.MONGO_URL || process.env.DASHBOARD_MONGODB_URI || 'mongodb://localhost:27017';
+const MONGO_URL =
+  process.env.MONGO_URL ||
+  process.env.DASHBOARD_MONGODB_URI ||
+  'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'fly8_production';
 
 mongoose
@@ -290,7 +309,8 @@ app.use('/api/v1/reach', publicContactRoutes);
 // HEALTH CHECK ENDPOINTS
 // =============================================================================
 app.get('/health', async (req, res) => {
-  const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+  const dbStatus =
+    mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
 
   res.json({
     success: true,
@@ -299,7 +319,8 @@ app.get('/health', async (req, res) => {
     uptime: process.uptime(),
     memory: {
       heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-      heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB',
+      heapTotal:
+        Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB',
     },
     environment: process.env.NODE_ENV || 'development',
     database: dbStatus,
@@ -389,7 +410,7 @@ app.use((err, req, res, next) => {
 // =============================================================================
 // SERVER STARTUP
 // =============================================================================
-if (require.main === module) {
+if (require.main === module && server) {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🚀 Fly8 Unified API Server running on port ${PORT}`);
     console.log(`📡 API Base URL: http://localhost:${PORT}/api/v1`);

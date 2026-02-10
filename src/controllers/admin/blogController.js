@@ -5,10 +5,27 @@
 
 const Blog = require('../../models/Blog');
 const { cloudinary } = require('../../config/cloudinary');
-const DOMPurify = require('isomorphic-dompurify');
+const sanitizeHtml = require('sanitize-html');
 
-// Sanitize HTML content
-const sanitizeContent = content => DOMPurify.sanitize(content);
+// Sanitize HTML content (using sanitize-html - pure JS, serverless-compatible)
+const sanitizeContent = content =>
+  sanitizeHtml(content, {
+    allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+      'img',
+      'h1',
+      'h2',
+      'figure',
+      'figcaption',
+      'iframe',
+    ]),
+    allowedAttributes: {
+      ...sanitizeHtml.defaults.allowedAttributes,
+      img: ['src', 'alt', 'title', 'width', 'height', 'loading'],
+      iframe: ['src', 'width', 'height', 'frameborder', 'allowfullscreen'],
+      '*': ['class', 'id', 'style'],
+    },
+    allowedIframeHostnames: ['www.youtube.com', 'player.vimeo.com'],
+  });
 
 // Upload to Cloudinary
 const uploadToCloudinary = async file => {
@@ -92,7 +109,8 @@ exports.createBlog = async (req, res) => {
       });
     }
 
-    const status = saveAsDraft === 'true' || saveAsDraft === true ? 'draft' : 'pending';
+    const status =
+      saveAsDraft === 'true' || saveAsDraft === true ? 'draft' : 'pending';
     const sanitizedContent = sanitizeContent(content);
 
     let imageUrl = image;
