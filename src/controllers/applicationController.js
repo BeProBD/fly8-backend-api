@@ -322,6 +322,16 @@ const updateStatus = async (req, res) => {
 
     await application.save();
 
+    // Auto-create commission when application reaches 'Completed' status
+    if (newStatus === 'Completed' && application.agentId) {
+      try {
+        const commissionService = require('../services/commissionService');
+        await commissionService.createApplicationCommission(application, userId);
+      } catch (commError) {
+        console.error('Commission creation error (non-blocking):', commError.message);
+      }
+    }
+
     // Notify student about status change
     try {
       const student = await Student.findOne({ studentId: application.studentId }).select('userId').lean();

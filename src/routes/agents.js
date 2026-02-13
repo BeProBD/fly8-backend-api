@@ -104,75 +104,287 @@ router.get('/my-students', authMiddleware, roleMiddleware('agent'), async (req, 
   }
 });
 
-// Get commission data
+// =============================================================================
+// COMMISSION, WALLET & PAYOUT ENDPOINTS
+// =============================================================================
+
+const Payout = require('../models/Payout');
+const { getAgentWallet, generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+const Settings = require('../models/Settings');
+
+/**
+ * @route   GET /api/agents/commissions
+ * @desc    Get commission list with filters and summary
+ * @access  Agent
+ */
 router.get('/commissions', authMiddleware, roleMiddleware('agent'), async (req, res) => {
   try {
-    const commissions = await Commission.find({ agentId: req.user.userId });
-    
-    const totalPending = commissions
-      .filter(c => c.status === 'pending')
-      .reduce((sum, c) => sum + c.amount, 0);
-    
-    const totalApproved = commissions
-      .filter(c => c.status === 'approved')
-      .reduce((sum, c) => sum + c.amount, 0);
-    
-    const totalPaid = commissions
-      .filter(c => c.status === 'paid')
-      .reduce((sum, c) => sum + c.amount, 0);
+    const agentId = req.user.userId;
+    const { status, commissionType, studentId, startDate, endDate, page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const query = { agentId, isDeleted: false };
+    if (status) query.status = status;
+    if (commissionType) query.commissionType = commissionType;
+    if (studentId) query.studentId = studentId;
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
+
+    const [commissions, total] = await Promise.all([
+      Commission.find(query).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+      Commission.countDocuments(query)
+    ]);
+
+    // Enrich with student names
+    const enrichedCommissions = await Promise.all(
+      commissions.map(async (c) => {
+        const student = await Student.findOne({ studentId: c.studentId }).lean();
+        const user = student ? await User.findOne({ userId: student.userId }).select('firstName lastName email avatar').lean() : null;
+        return { ...c, student: user };
+      })
+    );
+
+    // Calculate summary from all agent commissions (not just filtered)
+    const allCommissions = await Commission.find({ agentId, isDeleted: false }).lean();
+    const summary = {
+      totalPending: allCommissions.filter(c => c.status === 'pending').reduce((sum, c) => sum + c.amount, 0),
+      totalApproved: allCommissions.filter(c => c.status === 'approved').reduce((sum, c) => sum + c.amount, 0),
+      totalPaid: allCommissions.filter(c => c.status === 'paid').reduce((sum, c) => sum + c.amount, 0),
+      lifetimeEarnings: allCommissions.filter(c => c.status === 'paid').reduce((sum, c) => sum + c.amount, 0),
+      totalCommissions: allCommissions.length
+    };
 
     res.json({
-      commissions,
-      summary: {
-        totalPending,
-        totalApproved,
-        totalPaid,
-        lifetimeEarnings: totalPaid,
-        totalCommissions: commissions.length
-      }
+      commissions: enrichedCommissions,
+      summary,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) }
     });
   } catch (error) {
+    console.error('Get commissions error:', error);
     res.status(500).json({ error: 'Failed to fetch commissions' });
   }
 });
 
-// Request commission payout
+/**
+ * @route   POST /api/agents/commissions/:commissionId/request-payout
+ * @desc    Request payout for a single commission (legacy, kept for backward compatibility)
+ * @access  Agent
+ */
 router.post('/commissions/:commissionId/request-payout', authMiddleware, roleMiddleware('agent'), async (req, res) => {
   try {
     const { commissionId } = req.params;
-    
-    const commission = await Commission.findOne({ 
-      commissionId,
-      agentId: req.user.userId 
-    });
+    const commission = await Commission.findOne({ commissionId, agentId: req.user.userId });
 
-    if (!commission) {
-      return res.status(404).json({ error: 'Commission not found' });
-    }
-
+    if (!commission) return res.status(404).json({ error: 'Commission not found' });
     if (commission.status !== 'approved') {
-      return res.status(400).json({ error: 'Commission must be approved before payout' });
+      return res.status(400).json({ error: 'Commission must be approved before payout request' });
     }
 
-    // In production, integrate with Stripe Connect or bank transfer
-    commission.status = 'paid';
-    commission.paidAt = new Date();
+    commission.payoutRequestedAt = new Date();
+    commission.statusHistory.push({
+      status: 'approved',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: 'Payout requested by agent'
+    });
     await commission.save();
 
-    await logAudit(
-      req.user.userId,
-      'commission_paid',
-      'commission',
-      commissionId,
-      { amount: commission.amount },
-      req
-    );
+    await logAudit(req.user.userId, 'commission_payout_requested', 'commission', commissionId, { amount: commission.amount }, req);
+    emitToUser(req.user.userId, 'commission_payout_requested', commission);
 
-    emitToUser(req.user.userId, 'commission_paid', commission);
-
-    res.json({ message: 'Payout processed', commission });
+    res.json({ message: 'Payout request submitted', commission });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to process payout' });
+    res.status(500).json({ error: 'Failed to process payout request' });
+  }
+});
+
+/**
+ * @route   GET /api/agents/wallet
+ * @desc    Get agent wallet summary
+ * @access  Agent
+ */
+router.get('/wallet', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+  try {
+    const wallet = await getAgentWallet(req.user.userId);
+    res.json({ wallet });
+  } catch (error) {
+    console.error('Get wallet error:', error);
+    res.status(500).json({ error: 'Failed to fetch wallet data' });
+  }
+});
+
+/**
+ * @route   POST /api/agents/payouts/request
+ * @desc    Request a payout (withdrawal) from approved commissions
+ * @access  Agent
+ */
+router.post('/payouts/request', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+  try {
+    const agentId = req.user.userId;
+    const { amount, note } = req.body;
+
+    const wallet = await getAgentWallet(agentId);
+    const requestAmount = amount || wallet.availableBalance;
+
+    if (requestAmount <= 0) {
+      return res.status(400).json({ error: 'No approved balance available for withdrawal' });
+    }
+    if (requestAmount > wallet.availableBalance) {
+      return res.status(400).json({ error: `Requested amount ($${requestAmount}) exceeds available balance ($${wallet.availableBalance})` });
+    }
+    if (requestAmount < wallet.payoutThreshold) {
+      return res.status(400).json({ error: `Minimum payout amount is $${wallet.payoutThreshold}` });
+    }
+
+    // Get approved commissions to link to this payout
+    const approvedCommissions = await Commission.find({
+      agentId,
+      status: 'approved',
+      isDeleted: false
+    }).sort({ createdAt: 1 }).lean();
+
+    let runningTotal = 0;
+    const commissionIds = [];
+    for (const c of approvedCommissions) {
+      if (runningTotal >= requestAmount) break;
+      commissionIds.push(c.commissionId);
+      runningTotal += c.amount;
+    }
+
+    // Get agent bank details snapshot
+    const agent = await User.findOne({ userId: agentId }).lean();
+
+    const payout = new Payout({
+      payoutId: uuidv4(),
+      agentId,
+      amount: requestAmount,
+      commissionIds,
+      payoutMethod: 'bank_transfer',
+      bankDetailsSnapshot: agent.bankDetails || {},
+      agentNote: note || '',
+      statusHistory: [{
+        status: 'requested',
+        changedBy: agentId,
+        changedAt: new Date(),
+        note: 'Payout requested by agent'
+      }]
+    });
+
+    await payout.save();
+
+    // Notify super admins
+    const admins = await User.find({ role: 'super_admin', isActive: true }).lean();
+    for (const admin of admins) {
+      const notification = new Notification({
+        notificationId: uuidv4(),
+        recipientId: admin.userId,
+        type: 'PAYOUT_REQUESTED',
+        title: 'Payout Request',
+        message: `Agent ${agent.firstName} ${agent.lastName} requested a payout of $${requestAmount.toFixed(2)}`,
+        channel: 'BOTH',
+        priority: 'HIGH'
+      });
+      await notification.save();
+      emitToUser(admin.userId, 'new_notification', notification);
+    }
+
+    await logAudit(agentId, 'payout_requested', 'payout', payout.payoutId, { amount: requestAmount, commissionCount: commissionIds.length }, req);
+
+    res.json({ message: 'Payout request submitted successfully', payout });
+  } catch (error) {
+    console.error('Payout request error:', error);
+    res.status(500).json({ error: 'Failed to submit payout request' });
+  }
+});
+
+/**
+ * @route   GET /api/agents/payouts
+ * @desc    Get payout history
+ * @access  Agent
+ */
+router.get('/payouts', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+  try {
+    const agentId = req.user.userId;
+    const { status, page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const query = { agentId };
+    if (status) query.status = status;
+
+    const [payouts, total] = await Promise.all([
+      Payout.find(query).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+      Payout.countDocuments(query)
+    ]);
+
+    res.json({
+      payouts,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) }
+    });
+  } catch (error) {
+    console.error('Get payouts error:', error);
+    res.status(500).json({ error: 'Failed to fetch payouts' });
+  }
+});
+
+/**
+ * @route   GET /api/agents/commissions/export
+ * @desc    Export commissions as CSV
+ * @access  Agent
+ */
+router.get('/commissions/export', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+  try {
+    const agentId = req.user.userId;
+    const { startDate, endDate, status } = req.query;
+
+    const query = { agentId, isDeleted: false };
+    if (status) query.status = status;
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
+
+    const commissions = await Commission.find(query).sort({ createdAt: -1 }).lean();
+
+    // Enrich with student names
+    const rows = await Promise.all(commissions.map(async (c) => {
+      const student = await Student.findOne({ studentId: c.studentId }).lean();
+      const user = student ? await User.findOne({ userId: student.userId }).select('firstName lastName').lean() : null;
+      return {
+        referenceId: c.referenceId || '',
+        invoiceNumber: c.invoiceNumber || '',
+        type: c.commissionType || '',
+        studentName: user ? `${user.firstName} ${user.lastName}` : '',
+        universityName: c.universityName || '',
+        serviceType: c.serviceType || '',
+        baseAmount: c.baseAmount || 0,
+        percentage: c.percentage || 0,
+        amount: c.amount || 0,
+        currency: c.currency || 'USD',
+        status: c.status,
+        createdAt: c.createdAt ? new Date(c.createdAt).toISOString().split('T')[0] : '',
+        paidAt: c.paidAt ? new Date(c.paidAt).toISOString().split('T')[0] : ''
+      };
+    }));
+
+    const headers = ['Reference ID', 'Invoice', 'Type', 'Student', 'University', 'Service', 'Base Amount', 'Rate %', 'Commission', 'Currency', 'Status', 'Created', 'Paid'];
+    const csvRows = [headers.join(',')];
+    rows.forEach(r => {
+      csvRows.push([
+        r.referenceId, r.invoiceNumber, r.type, `"${r.studentName}"`, `"${r.universityName}"`,
+        r.serviceType, r.baseAmount, r.percentage, r.amount, r.currency, r.status, r.createdAt, r.paidAt
+      ].join(','));
+    });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=commissions-${new Date().toISOString().split('T')[0]}.csv`);
+    res.send(csvRows.join('\n'));
+  } catch (error) {
+    console.error('Export commissions error:', error);
+    res.status(500).json({ error: 'Failed to export commissions' });
   }
 });
 
@@ -915,48 +1127,65 @@ router.post('/refer-student', authMiddleware, roleMiddleware('agent'), async (re
 
 /**
  * @route   GET /api/agents/commission-stats
- * @desc    Get commission statistics
+ * @desc    Get commission statistics with breakdowns
  * @access  Agent
  */
 router.get('/commission-stats', authMiddleware, roleMiddleware('agent'), async (req, res) => {
   try {
     const agentId = req.user.userId;
-
-    const commissions = await Commission.find({ agentId });
+    const commissions = await Commission.find({ agentId, isDeleted: false }).lean();
 
     const paidCommissions = commissions.filter(c => c.status === 'paid');
-    const pendingCommissions = commissions.filter(c => c.status === 'pending' || c.status === 'approved');
+    const approvedCommissions = commissions.filter(c => c.status === 'approved');
+    const pendingCommissions = commissions.filter(c => c.status === 'pending');
 
     // This month's earnings
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const thisMonthPaid = paidCommissions
-      .filter(c => new Date(c.paidAt) >= startOfMonth)
+    const thisMonthEarned = commissions
+      .filter(c => new Date(c.createdAt) >= startOfMonth)
       .reduce((sum, c) => sum + c.amount, 0);
 
-    // Last month's earnings for growth calculation
+    // Last month's for growth calculation
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
-    const lastMonthPaid = paidCommissions
+    const lastMonthEarned = commissions
       .filter(c => {
-        const paidDate = new Date(c.paidAt);
-        return paidDate >= startOfLastMonth && paidDate <= endOfLastMonth;
+        const d = new Date(c.createdAt);
+        return d >= startOfLastMonth && d <= endOfLastMonth;
       })
       .reduce((sum, c) => sum + c.amount, 0);
 
-    // Calculate growth percentage
-    const growth = lastMonthPaid > 0
-      ? Math.round(((thisMonthPaid - lastMonthPaid) / lastMonthPaid) * 100)
-      : thisMonthPaid > 0 ? 100 : 0;
+    const growth = lastMonthEarned > 0
+      ? Math.round(((thisMonthEarned - lastMonthEarned) / lastMonthEarned) * 100)
+      : thisMonthEarned > 0 ? 100 : 0;
+
+    // Application vs VAS breakdown
+    const applicationCommissions = commissions.filter(c => c.commissionType === 'APPLICATION');
+    const vasCommissions = commissions.filter(c => c.commissionType === 'VAS');
+
+    const wallet = await getAgentWallet(agentId);
 
     res.json({
       stats: {
         totalEarnings: paidCommissions.reduce((sum, c) => sum + c.amount, 0),
         pendingAmount: pendingCommissions.reduce((sum, c) => sum + c.amount, 0),
+        approvedAmount: approvedCommissions.reduce((sum, c) => sum + c.amount, 0),
         paidAmount: paidCommissions.reduce((sum, c) => sum + c.amount, 0),
-        thisMonth: thisMonthPaid,
-        growth
-      }
+        thisMonth: thisMonthEarned,
+        growth,
+        averageCommission: commissions.length > 0 ? Math.round(commissions.reduce((sum, c) => sum + c.amount, 0) / commissions.length) : 0,
+        totalCount: commissions.length,
+        applicationCommissions: {
+          count: applicationCommissions.length,
+          total: applicationCommissions.reduce((sum, c) => sum + c.amount, 0)
+        },
+        vasCommissions: {
+          count: vasCommissions.length,
+          total: vasCommissions.reduce((sum, c) => sum + c.amount, 0)
+        }
+      },
+      wallet
     });
   } catch (error) {
     console.error('Commission stats error:', error);
@@ -966,56 +1195,88 @@ router.get('/commission-stats', authMiddleware, roleMiddleware('agent'), async (
 
 /**
  * @route   GET /api/agents/commission-history
- * @desc    Get commission history with breakdown
+ * @desc    Get commission history with filters and breakdown
  * @access  Agent
  */
 router.get('/commission-history', authMiddleware, roleMiddleware('agent'), async (req, res) => {
   try {
     const agentId = req.user.userId;
-    const { page = 1, limit = 20 } = req.query;
-    const skip = (page - 1) * limit;
+    const { page = 1, limit = 20, status, commissionType, startDate, endDate } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const commissions = await Commission.find({ agentId })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit))
-      .lean();
+    const query = { agentId, isDeleted: false };
+    if (status) query.status = status;
+    if (commissionType) query.commissionType = commissionType;
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
 
-    const total = await Commission.countDocuments({ agentId });
+    const [commissions, total] = await Promise.all([
+      Commission.find(query).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+      Commission.countDocuments(query)
+    ]);
 
     // Enrich with student data
     const transactions = await Promise.all(
       commissions.map(async (commission) => {
         const student = await Student.findOne({ studentId: commission.studentId }).lean();
-        const user = student ? await User.findOne({ userId: student.userId }).select('-password').lean() : null;
+        const user = student ? await User.findOne({ userId: student.userId }).select('firstName lastName email avatar').lean() : null;
         return {
           id: commission.commissionId,
+          referenceId: commission.referenceId,
+          invoiceNumber: commission.invoiceNumber,
+          commissionType: commission.commissionType,
           student: user,
-          service: commission.serviceType || 'Service Request',
+          service: commission.serviceType || commission.universityName || 'Service Request',
+          universityName: commission.universityName,
+          programName: commission.programName,
+          serviceType: commission.serviceType,
+          baseAmount: commission.baseAmount,
+          percentage: commission.percentage,
           amount: commission.amount,
+          currency: commission.currency,
           status: commission.status,
+          description: commission.description,
           paidAt: commission.paidAt,
-          createdAt: commission.createdAt
+          createdAt: commission.createdAt,
+          approvedAt: commission.approvedAt
         };
       })
     );
 
-    // Calculate breakdown by service type
-    const allCommissions = await Commission.find({ agentId });
+    // Calculate breakdown by service/university (from all agent commissions)
+    const allCommissions = await Commission.find({ agentId, isDeleted: false }).lean();
     const serviceBreakdown = {};
+    const universityBreakdown = {};
 
     allCommissions.forEach(c => {
-      const service = c.serviceType || 'Other Services';
-      if (!serviceBreakdown[service]) {
-        serviceBreakdown[service] = { count: 0, total: 0 };
-      }
+      // Service breakdown
+      const service = c.serviceType || (c.commissionType === 'APPLICATION' ? 'University Application' : 'Other');
+      if (!serviceBreakdown[service]) serviceBreakdown[service] = { count: 0, total: 0 };
       serviceBreakdown[service].count++;
       serviceBreakdown[service].total += c.amount;
+
+      // University breakdown
+      if (c.universityName) {
+        if (!universityBreakdown[c.universityName]) universityBreakdown[c.universityName] = { count: 0, total: 0 };
+        universityBreakdown[c.universityName].count++;
+        universityBreakdown[c.universityName].total += c.amount;
+      }
     });
 
     const totalAmount = allCommissions.reduce((sum, c) => sum + c.amount, 0);
+
     const breakdown = Object.entries(serviceBreakdown).map(([service, data]) => ({
       service,
+      count: data.count,
+      total: data.total,
+      percentage: totalAmount > 0 ? Math.round((data.total / totalAmount) * 100) : 0
+    })).sort((a, b) => b.total - a.total);
+
+    const universityBreakdownArr = Object.entries(universityBreakdown).map(([university, data]) => ({
+      university,
       count: data.count,
       total: data.total,
       percentage: totalAmount > 0 ? Math.round((data.total / totalAmount) * 100) : 0
@@ -1024,12 +1285,8 @@ router.get('/commission-history', authMiddleware, roleMiddleware('agent'), async
     res.json({
       transactions,
       breakdown,
-      pagination: {
-        total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        totalPages: Math.ceil(total / limit)
-      }
+      universityBreakdown: universityBreakdownArr,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) }
     });
   } catch (error) {
     console.error('Commission history error:', error);
@@ -1039,14 +1296,13 @@ router.get('/commission-history', authMiddleware, roleMiddleware('agent'), async
 
 /**
  * @route   GET /api/agents/earnings
- * @desc    Get earnings summary
+ * @desc    Get comprehensive earnings summary with monthly breakdown
  * @access  Agent
  */
 router.get('/earnings', authMiddleware, roleMiddleware('agent'), async (req, res) => {
   try {
     const agentId = req.user.userId;
-
-    const commissions = await Commission.find({ agentId });
+    const commissions = await Commission.find({ agentId, isDeleted: false }).lean();
 
     const earnings = {
       total: commissions.reduce((sum, c) => sum + c.amount, 0),
@@ -1055,7 +1311,79 @@ router.get('/earnings', authMiddleware, roleMiddleware('agent'), async (req, res
       paid: commissions.filter(c => c.status === 'paid').reduce((sum, c) => sum + c.amount, 0)
     };
 
-    res.json({ earnings });
+    // Wallet data
+    const wallet = await getAgentWallet(agentId);
+
+    // Monthly breakdown (last 12 months)
+    const monthlyBreakdown = [];
+    const now = new Date();
+    for (let i = 0; i < 12; i++) {
+      const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 0, 23, 59, 59);
+      const monthCommissions = commissions.filter(c => {
+        const d = new Date(c.createdAt);
+        return d >= monthStart && d <= monthEnd;
+      });
+      if (monthCommissions.length > 0 || i < 6) {
+        const amount = monthCommissions.reduce((sum, c) => sum + c.amount, 0);
+        // Calculate growth vs previous month
+        const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - i - 1, 1);
+        const prevMonthEnd = new Date(now.getFullYear(), now.getMonth() - i, 0, 23, 59, 59);
+        const prevAmount = commissions
+          .filter(c => { const d = new Date(c.createdAt); return d >= prevMonthStart && d <= prevMonthEnd; })
+          .reduce((sum, c) => sum + c.amount, 0);
+        const growth = prevAmount > 0 ? Math.round(((amount - prevAmount) / prevAmount) * 100) : (amount > 0 ? 100 : 0);
+
+        monthlyBreakdown.push({
+          month: monthStart.toLocaleString('en-US', { month: 'long', year: 'numeric' }),
+          year: monthStart.getFullYear(),
+          monthIndex: monthStart.getMonth(),
+          referrals: monthCommissions.length,
+          amount,
+          growth: `${growth >= 0 ? '+' : ''}${growth}%`
+        });
+      }
+    }
+
+    // By student breakdown
+    const studentMap = {};
+    commissions.forEach(c => {
+      if (!studentMap[c.studentId]) studentMap[c.studentId] = { studentId: c.studentId, total: 0, count: 0 };
+      studentMap[c.studentId].total += c.amount;
+      studentMap[c.studentId].count++;
+    });
+    const byStudent = await Promise.all(
+      Object.values(studentMap).sort((a, b) => b.total - a.total).slice(0, 10).map(async (s) => {
+        const student = await Student.findOne({ studentId: s.studentId }).lean();
+        const user = student ? await User.findOne({ userId: student.userId }).select('firstName lastName').lean() : null;
+        return { ...s, name: user ? `${user.firstName} ${user.lastName}` : 'Unknown' };
+      })
+    );
+
+    // By university breakdown
+    const uniMap = {};
+    commissions.filter(c => c.universityName).forEach(c => {
+      if (!uniMap[c.universityName]) uniMap[c.universityName] = { universityName: c.universityName, total: 0, count: 0 };
+      uniMap[c.universityName].total += c.amount;
+      uniMap[c.universityName].count++;
+    });
+    const byUniversity = Object.values(uniMap).sort((a, b) => b.total - a.total);
+
+    // By service type breakdown
+    const svcMap = {};
+    const totalAll = commissions.reduce((sum, c) => sum + c.amount, 0);
+    commissions.forEach(c => {
+      const key = c.serviceType || (c.commissionType === 'APPLICATION' ? 'University Application' : 'Other');
+      if (!svcMap[key]) svcMap[key] = { serviceType: key, total: 0, count: 0 };
+      svcMap[key].total += c.amount;
+      svcMap[key].count++;
+    });
+    const byServiceType = Object.values(svcMap).map(s => ({
+      ...s,
+      percentage: totalAll > 0 ? Math.round((s.total / totalAll) * 100) : 0
+    })).sort((a, b) => b.total - a.total);
+
+    res.json({ earnings, wallet, monthlyBreakdown, byStudent, byUniversity, byServiceType });
   } catch (error) {
     console.error('Earnings error:', error);
     res.status(500).json({ error: 'Failed to fetch earnings' });
@@ -1461,6 +1789,17 @@ router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async
     } catch (auditError) {
       console.error('[STATUS UPDATE] Audit logging failed (non-fatal):', auditError.message);
       // Don't throw - audit failure shouldn't block the operation
+    }
+
+    // Auto-create VAS commission when service request reaches COMPLETED
+    if (status === 'COMPLETED' && serviceRequest.assignedAgent) {
+      try {
+        const commissionService = require('../services/commissionService');
+        await commissionService.createVASCommission(serviceRequest, agentId);
+        console.log('[STATUS UPDATE] VAS commission created');
+      } catch (commError) {
+        console.error('[STATUS UPDATE] Commission creation failed (non-fatal):', commError.message);
+      }
     }
 
     // Notify student of status change (non-blocking)

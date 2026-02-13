@@ -1480,6 +1480,16 @@ router.patch('/service-requests/:requestId/status', authMiddleware, roleMiddlewa
 
     await serviceRequest.save();
 
+    // Auto-create VAS commission when service request reaches COMPLETED
+    if (status === 'COMPLETED' && serviceRequest.assignedAgent) {
+      try {
+        const commissionService = require('../services/commissionService');
+        await commissionService.createVASCommission(serviceRequest, req.user.userId);
+      } catch (commError) {
+        console.error('Commission creation error (non-blocking):', commError.message);
+      }
+    }
+
     // Audit log
     await logAudit(
       req.user.userId,
@@ -1594,41 +1604,39 @@ router.get('/commissions', authMiddleware, roleMiddleware('super_admin'), async 
 router.put('/commissions/:commissionId/approve', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
   try {
     const { commissionId } = req.params;
-
     const commission = await Commission.findOne({ commissionId });
-    if (!commission) {
-      return res.status(404).json({ error: 'Commission not found' });
-    }
+    if (!commission) return res.status(404).json({ error: 'Commission not found' });
+    if (commission.status !== 'pending') return res.status(400).json({ error: 'Commission is not in pending status' });
 
-    if (commission.status !== 'pending') {
-      return res.status(400).json({ error: 'Commission is not in pending status' });
-    }
+    const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
 
     commission.status = 'approved';
+    commission.approvedBy = req.user.userId;
+    commission.approvedAt = new Date();
+    commission.invoiceNumber = await generateInvoiceNumber();
+    commission.statusHistory.push({
+      status: 'approved',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: 'Approved by admin'
+    });
     await commission.save();
+    await updateAgentEarnings(commission.agentId);
 
-    // Audit log
-    await logAudit(
-      req.user.userId,
-      'commission_approved',
-      'commission',
-      commissionId,
-      { amount: commission.amount, agentId: commission.agentId },
-      req
-    );
+    await logAudit(req.user.userId, 'commission_approved', 'commission', commissionId, { amount: commission.amount, agentId: commission.agentId }, req);
 
-    // Notify agent
     const notification = new Notification({
       notificationId: uuidv4(),
       recipientId: commission.agentId,
       type: 'COMMISSION_CREDITED',
       title: 'Commission Approved',
-      message: `Your commission of $${commission.amount} has been approved`,
+      message: `Your commission of $${commission.amount.toFixed(2)} has been approved. Invoice: ${commission.invoiceNumber}`,
       channel: 'BOTH',
       metadata: { commissionId }
     });
     await notification.save();
     emitToUser(commission.agentId, 'new_notification', notification);
+    emitToUser(commission.agentId, 'commission_approved', commission);
 
     res.json({ message: 'Commission approved', commission });
   } catch (error) {
@@ -1638,54 +1646,403 @@ router.put('/commissions/:commissionId/approve', authMiddleware, roleMiddleware(
 });
 
 /**
- * @route   POST /api/admin/commissions/:commissionId/payout
- * @desc    Process commission payout
+ * @route   PUT /api/admin/commissions/:commissionId/reject
+ * @desc    Reject commission
  * @access  Super Admin
  */
-router.post('/commissions/:commissionId/payout', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+router.put('/commissions/:commissionId/reject', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
   try {
     const { commissionId } = req.params;
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ error: 'Rejection reason is required' });
 
     const commission = await Commission.findOne({ commissionId });
-    if (!commission) {
-      return res.status(404).json({ error: 'Commission not found' });
-    }
+    if (!commission) return res.status(404).json({ error: 'Commission not found' });
+    if (commission.status !== 'pending') return res.status(400).json({ error: 'Only pending commissions can be rejected' });
 
-    if (commission.status !== 'approved') {
-      return res.status(400).json({ error: 'Commission must be approved before payout' });
-    }
+    const { updateAgentEarnings } = require('../services/commissionService');
 
-    commission.status = 'paid';
-    commission.paidAt = new Date();
+    commission.status = 'rejected';
+    commission.rejectedBy = req.user.userId;
+    commission.rejectedAt = new Date();
+    commission.rejectionReason = reason;
+    commission.statusHistory.push({
+      status: 'rejected',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: `Rejected: ${reason}`
+    });
     await commission.save();
+    await updateAgentEarnings(commission.agentId);
 
-    // Audit log
-    await logAudit(
-      req.user.userId,
-      'commission_paid',
-      'commission',
-      commissionId,
-      { amount: commission.amount, agentId: commission.agentId },
-      req
-    );
+    await logAudit(req.user.userId, 'commission_rejected', 'commission', commissionId, { amount: commission.amount, reason }, req);
 
-    // Notify agent
     const notification = new Notification({
       notificationId: uuidv4(),
       recipientId: commission.agentId,
-      type: 'COMMISSION_CREDITED',
-      title: 'Commission Paid',
-      message: `Your commission of $${commission.amount} has been paid`,
+      type: 'COMMISSION_REJECTED',
+      title: 'Commission Rejected',
+      message: `Your commission of $${commission.amount.toFixed(2)} has been rejected. Reason: ${reason}`,
       channel: 'BOTH',
+      priority: 'HIGH',
       metadata: { commissionId }
     });
     await notification.save();
     emitToUser(commission.agentId, 'new_notification', notification);
 
+    res.json({ message: 'Commission rejected', commission });
+  } catch (error) {
+    console.error('Reject commission error:', error);
+    res.status(500).json({ error: 'Failed to reject commission' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/commissions/:commissionId/payout
+ * @desc    Process commission payout (mark as paid)
+ * @access  Super Admin
+ */
+router.post('/commissions/:commissionId/payout', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { commissionId } = req.params;
+    const { externalReference } = req.body;
+
+    const commission = await Commission.findOne({ commissionId });
+    if (!commission) return res.status(404).json({ error: 'Commission not found' });
+    if (commission.status !== 'approved') return res.status(400).json({ error: 'Commission must be approved before payout' });
+
+    const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+
+    commission.status = 'paid';
+    commission.paidAt = new Date();
+    commission.processedBy = req.user.userId;
+    commission.payoutReference = externalReference || '';
+    if (!commission.invoiceNumber) {
+      commission.invoiceNumber = await generateInvoiceNumber();
+    }
+    commission.statusHistory.push({
+      status: 'paid',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: 'Payout processed by admin'
+    });
+    await commission.save();
+    await updateAgentEarnings(commission.agentId);
+
+    await logAudit(req.user.userId, 'commission_paid', 'commission', commissionId, { amount: commission.amount, agentId: commission.agentId }, req);
+
+    const notification = new Notification({
+      notificationId: uuidv4(),
+      recipientId: commission.agentId,
+      type: 'COMMISSION_CREDITED',
+      title: 'Commission Paid',
+      message: `Your commission of $${commission.amount.toFixed(2)} has been paid to your account`,
+      channel: 'BOTH',
+      metadata: { commissionId }
+    });
+    await notification.save();
+    emitToUser(commission.agentId, 'new_notification', notification);
+    emitToUser(commission.agentId, 'commission_paid', commission);
+
     res.json({ message: 'Commission payout processed', commission });
   } catch (error) {
     console.error('Process payout error:', error);
     res.status(500).json({ error: 'Failed to process payout' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/commissions/create
+ * @desc    Manually create a commission
+ * @access  Super Admin
+ */
+router.post('/commissions/create', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { agentId, studentId, amount, commissionType, description, applicationId, serviceRequestId, universityName, serviceType, baseAmount, percentage } = req.body;
+
+    if (!agentId || !studentId || !amount || !commissionType) {
+      return res.status(400).json({ error: 'agentId, studentId, amount, and commissionType are required' });
+    }
+
+    const agent = await User.findOne({ userId: agentId, role: 'agent' });
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    const commission = new Commission({
+      commissionId: uuidv4(),
+      agentId,
+      studentId,
+      commissionType,
+      applicationId,
+      serviceRequestId,
+      universityName,
+      serviceType,
+      baseAmount: baseAmount || amount,
+      percentage: percentage || agent.commissionPercentage || 10,
+      amount,
+      currency: 'USD',
+      status: 'approved',
+      approvedBy: req.user.userId,
+      approvedAt: new Date(),
+      description: description || 'Manually created by admin',
+      adminNotes: `Created by admin ${req.user.userId}`,
+      statusHistory: [
+        { status: 'pending', changedBy: req.user.userId, changedAt: new Date(), note: 'Manual commission created' },
+        { status: 'approved', changedBy: req.user.userId, changedAt: new Date(), note: 'Auto-approved (admin created)' }
+      ]
+    });
+
+    const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+    commission.invoiceNumber = await generateInvoiceNumber();
+    await commission.save();
+    await updateAgentEarnings(agentId);
+
+    await logAudit(req.user.userId, 'commission_created', 'commission', commission.commissionId, { amount, agentId, manual: true }, req);
+
+    const notification = new Notification({
+      notificationId: uuidv4(),
+      recipientId: agentId,
+      type: 'COMMISSION_EARNED',
+      title: 'New Commission Added',
+      message: `A commission of $${amount.toFixed(2)} has been added to your account`,
+      channel: 'BOTH',
+      metadata: { commissionId: commission.commissionId }
+    });
+    await notification.save();
+    emitToUser(agentId, 'new_notification', notification);
+
+    res.json({ message: 'Commission created successfully', commission });
+  } catch (error) {
+    console.error('Create commission error:', error);
+    res.status(500).json({ error: 'Failed to create commission' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/commissions/bulk-approve
+ * @desc    Bulk approve pending commissions
+ * @access  Super Admin
+ */
+router.post('/commissions/bulk-approve', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { commissionIds } = req.body;
+    if (!commissionIds || !Array.isArray(commissionIds) || commissionIds.length === 0) {
+      return res.status(400).json({ error: 'commissionIds array is required' });
+    }
+
+    const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+    const results = { approved: 0, skipped: 0, errors: [] };
+    const affectedAgents = new Set();
+
+    for (const commissionId of commissionIds) {
+      try {
+        const commission = await Commission.findOne({ commissionId, status: 'pending' });
+        if (!commission) { results.skipped++; continue; }
+
+        commission.status = 'approved';
+        commission.approvedBy = req.user.userId;
+        commission.approvedAt = new Date();
+        commission.invoiceNumber = await generateInvoiceNumber();
+        commission.statusHistory.push({
+          status: 'approved',
+          changedBy: req.user.userId,
+          changedAt: new Date(),
+          note: 'Bulk approved by admin'
+        });
+        await commission.save();
+        affectedAgents.add(commission.agentId);
+        results.approved++;
+
+        // Notify agent
+        const notification = new Notification({
+          notificationId: uuidv4(),
+          recipientId: commission.agentId,
+          type: 'COMMISSION_CREDITED',
+          title: 'Commission Approved',
+          message: `Your commission of $${commission.amount.toFixed(2)} has been approved`,
+          channel: 'DASHBOARD'
+        });
+        await notification.save();
+        emitToUser(commission.agentId, 'new_notification', notification);
+      } catch (e) {
+        results.errors.push({ commissionId, error: e.message });
+      }
+    }
+
+    // Update earnings for all affected agents
+    for (const agentId of affectedAgents) {
+      await updateAgentEarnings(agentId);
+    }
+
+    await logAudit(req.user.userId, 'commissions_bulk_approved', 'commission', null, { count: results.approved }, req);
+    res.json({ message: `${results.approved} commissions approved`, results });
+  } catch (error) {
+    console.error('Bulk approve error:', error);
+    res.status(500).json({ error: 'Failed to bulk approve commissions' });
+  }
+});
+
+// =============================================================================
+// PAYOUT MANAGEMENT (Admin)
+// =============================================================================
+
+const Payout = require('../models/Payout');
+
+/**
+ * @route   GET /api/admin/payouts
+ * @desc    Get all payout requests
+ * @access  Super Admin
+ */
+router.get('/payouts', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { status, agentId, page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const query = {};
+    if (status) query.status = status;
+    if (agentId) query.agentId = agentId;
+
+    const [payouts, total] = await Promise.all([
+      Payout.find(query).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+      Payout.countDocuments(query)
+    ]);
+
+    // Enrich with agent names
+    const enrichedPayouts = await Promise.all(payouts.map(async (p) => {
+      const agent = await User.findOne({ userId: p.agentId }).select('firstName lastName email').lean();
+      return { ...p, agent };
+    }));
+
+    res.json({
+      payouts: enrichedPayouts,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) }
+    });
+  } catch (error) {
+    console.error('Get payouts error:', error);
+    res.status(500).json({ error: 'Failed to fetch payouts' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/payouts/:payoutId/process
+ * @desc    Process a payout request (mark as completed, pay linked commissions)
+ * @access  Super Admin
+ */
+router.post('/payouts/:payoutId/process', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { payoutId } = req.params;
+    const { externalReference, note } = req.body;
+
+    const payout = await Payout.findOne({ payoutId });
+    if (!payout) return res.status(404).json({ error: 'Payout not found' });
+    if (payout.status !== 'requested' && payout.status !== 'processing') {
+      return res.status(400).json({ error: 'Payout is not in a processable state' });
+    }
+
+    const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+
+    payout.status = 'completed';
+    payout.processedAt = new Date();
+    payout.processedBy = req.user.userId;
+    payout.externalReference = externalReference || '';
+    payout.adminNote = note || '';
+    payout.invoiceNumber = `FLY8-PAY-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+    payout.statusHistory.push({
+      status: 'completed',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: note || 'Payout processed'
+    });
+    await payout.save();
+
+    // Mark all linked commissions as paid
+    for (const commissionId of payout.commissionIds) {
+      const commission = await Commission.findOne({ commissionId });
+      if (commission && commission.status === 'approved') {
+        commission.status = 'paid';
+        commission.paidAt = new Date();
+        commission.processedBy = req.user.userId;
+        commission.payoutReference = payout.payoutId;
+        if (!commission.invoiceNumber) {
+          commission.invoiceNumber = await generateInvoiceNumber();
+        }
+        commission.statusHistory.push({
+          status: 'paid',
+          changedBy: req.user.userId,
+          changedAt: new Date(),
+          note: `Paid via payout ${payout.payoutId}`
+        });
+        await commission.save();
+      }
+    }
+
+    await updateAgentEarnings(payout.agentId);
+
+    await logAudit(req.user.userId, 'payout_processed', 'payout', payoutId, { amount: payout.amount, agentId: payout.agentId }, req);
+
+    // Notify agent
+    const notification = new Notification({
+      notificationId: uuidv4(),
+      recipientId: payout.agentId,
+      type: 'PAYOUT_COMPLETED',
+      title: 'Payout Processed',
+      message: `Your payout of $${payout.amount.toFixed(2)} has been processed`,
+      channel: 'BOTH',
+      priority: 'HIGH'
+    });
+    await notification.save();
+    emitToUser(payout.agentId, 'new_notification', notification);
+    emitToUser(payout.agentId, 'payout_completed', payout);
+
+    res.json({ message: 'Payout processed successfully', payout });
+  } catch (error) {
+    console.error('Process payout error:', error);
+    res.status(500).json({ error: 'Failed to process payout' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/payouts/:payoutId/reject
+ * @desc    Reject a payout request
+ * @access  Super Admin
+ */
+router.post('/payouts/:payoutId/reject', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { payoutId } = req.params;
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ error: 'Rejection reason is required' });
+
+    const payout = await Payout.findOne({ payoutId });
+    if (!payout) return res.status(404).json({ error: 'Payout not found' });
+    if (payout.status !== 'requested') return res.status(400).json({ error: 'Only requested payouts can be rejected' });
+
+    payout.status = 'failed';
+    payout.failureReason = reason;
+    payout.statusHistory.push({
+      status: 'failed',
+      changedBy: req.user.userId,
+      changedAt: new Date(),
+      note: `Rejected: ${reason}`
+    });
+    await payout.save();
+
+    await logAudit(req.user.userId, 'payout_rejected', 'payout', payoutId, { amount: payout.amount, reason }, req);
+
+    const notification = new Notification({
+      notificationId: uuidv4(),
+      recipientId: payout.agentId,
+      type: 'PAYOUT_FAILED',
+      title: 'Payout Request Rejected',
+      message: `Your payout request of $${payout.amount.toFixed(2)} was rejected. Reason: ${reason}`,
+      channel: 'BOTH',
+      priority: 'HIGH'
+    });
+    await notification.save();
+    emitToUser(payout.agentId, 'new_notification', notification);
+
+    res.json({ message: 'Payout request rejected', payout });
+  } catch (error) {
+    console.error('Reject payout error:', error);
+    res.status(500).json({ error: 'Failed to reject payout' });
   }
 });
 
