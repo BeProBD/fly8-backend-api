@@ -13,6 +13,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
+const os = require('os');
 const http = require('http');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
@@ -151,7 +152,7 @@ app.use((req, res, next) => {
 
   fileUpload({
     useTempFiles: !IS_VERCEL,
-    tempFileDir: IS_VERCEL ? undefined : '/tmp/',
+    tempFileDir: IS_VERCEL ? undefined : os.tmpdir(),
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
     abortOnLimit: true,
     createParentPath: true,
