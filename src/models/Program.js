@@ -95,6 +95,10 @@ const ProgramSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    universityWebsite: {
+      type: String,
+      trim: true,
+    },
     // Additional fields for dashboard integration
     isActive: {
       type: Boolean,

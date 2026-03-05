@@ -230,9 +230,24 @@ const checkResourceAccess = (resourceType, resourceIdParam = 'id') => {
   };
 };
 
+/**
+ * Editor middleware
+ * Allows access to users with role 'editor' or 'super_admin'
+ */
+const isEditor = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (req.user.role !== 'editor' && req.user.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Editor access required' });
+  }
+  next();
+};
+
 module.exports = {
   authMiddleware,
   roleMiddleware,
+  isEditor,
   getRoleBasedFilter,
   canAccessResource,
   getDashboardUrl,

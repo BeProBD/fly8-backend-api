@@ -145,7 +145,11 @@ app.use((req, res, next) => {
   // Skip for blog routes that use multer
   if (
     req.path.startsWith('/api/v1/public/blogs') ||
-    req.path.startsWith('/api/v1/admin/blogs')
+    req.path.startsWith('/api/v1/admin/blogs') ||
+    req.path.startsWith('/api/v1/editor/blogs') ||
+    req.path.startsWith('/api/v1/editor/offers') ||
+    req.path.startsWith('/api/v1/editor/success-stories') ||
+    req.path.startsWith('/api/v1/editor/cms-events')
   ) {
     return next();
   }
@@ -220,6 +224,8 @@ const publicCountryRoutes = require('./routes/public/countries');
 const publicBlogRoutes = require('./routes/public/blogs');
 const publicEventRoutes = require('./routes/public/events');
 const publicContactRoutes = require('./routes/public/contact');
+const publicSuccessStoryRoutes = require('./routes/public/successStories');
+const publicCmsEventRoutes = require('./routes/public/cmsEvents');
 
 // Admin Content Management Routes
 const adminUniversityRoutes = require('./routes/admin/universities');
@@ -227,6 +233,13 @@ const adminProgramRoutes = require('./routes/admin/programs');
 const adminCountryRoutes = require('./routes/admin/countries');
 const adminBlogRoutes = require('./routes/admin/blogs');
 const adminEventRoutes = require('./routes/admin/events');
+
+// Editor CMS Routes
+const editorBlogRoutes = require('./routes/editor/blogs');
+const editorProgramRoutes = require('./routes/editor/programs');
+const editorOfferRoutes = require('./routes/editor/offers');
+const editorSuccessStoryRoutes = require('./routes/editor/successStories');
+const editorCmsEventRoutes = require('./routes/editor/cmsEvents');
 
 // =============================================================================
 // ROOT ROUTE
@@ -256,6 +269,9 @@ app.use('/api/v1/public/countries', publicCountryRoutes);
 app.use('/api/v1/public/blogs', publicBlogRoutes);
 app.use('/api/v1/public/events', publicEventRoutes);
 app.use('/api/v1/public/contact', publicContactRoutes);
+app.use('/api/v1/public/success-stories', publicSuccessStoryRoutes);
+app.use('/api/v1/public/cms-events', publicCmsEventRoutes);
+app.use('/api/v1/public/offers', require('./routes/public/offers'));
 
 // =============================================================================
 // AUTHENTICATION ROUTES
@@ -278,6 +294,15 @@ app.use('/api/v1/upload', uploadRoutes);
 app.use('/api/v1/chat', chatRoutes);
 app.use('/api/v1/admissions', admissionsRoutes);
 app.use('/api/v1/universities', universitiesRoutes);
+
+// =============================================================================
+// EDITOR CMS ROUTES (Editor + Super Admin)
+// =============================================================================
+app.use('/api/v1/editor/blogs', editorBlogRoutes);
+app.use('/api/v1/editor/programs', editorProgramRoutes);
+app.use('/api/v1/editor/offers', editorOfferRoutes);
+app.use('/api/v1/editor/success-stories', editorSuccessStoryRoutes);
+app.use('/api/v1/editor/cms-events', editorCmsEventRoutes);
 
 // =============================================================================
 // ADMIN ROUTES (Super Admin Only)
