@@ -237,6 +237,7 @@ const adminEventRoutes = require('./routes/admin/events');
 // Editor CMS Routes
 const editorBlogRoutes = require('./routes/editor/blogs');
 const editorProgramRoutes = require('./routes/editor/programs');
+const editorUniversityRoutes = require('./routes/editor/universities');
 const editorOfferRoutes = require('./routes/editor/offers');
 const editorSuccessStoryRoutes = require('./routes/editor/successStories');
 const editorCmsEventRoutes = require('./routes/editor/cmsEvents');
@@ -300,6 +301,7 @@ app.use('/api/v1/universities', universitiesRoutes);
 // =============================================================================
 app.use('/api/v1/editor/blogs', editorBlogRoutes);
 app.use('/api/v1/editor/programs', editorProgramRoutes);
+app.use('/api/v1/editor/universities', editorUniversityRoutes);
 app.use('/api/v1/editor/offers', editorOfferRoutes);
 app.use('/api/v1/editor/success-stories', editorSuccessStoryRoutes);
 app.use('/api/v1/editor/cms-events', editorCmsEventRoutes);

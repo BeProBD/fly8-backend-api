@@ -1,12 +1,24 @@
 /**
  * Program Model
  * Academic programs offered by universities
+ * Programs reference a University document via universityId (one-to-many).
  */
 
 const mongoose = require('mongoose');
 
 const ProgramSchema = new mongoose.Schema(
   {
+    // ── University reference (one-to-many) ──────────────────────────────────
+    // Set when a program is linked to a University document.
+    // universityName, country, location are kept as denormalised strings
+    // so public queries remain fast without a join, but universityId is the
+    // authoritative source of truth for linked programs.
+    universityId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'University',
+      index: true,
+    },
+
     country: {
       type: String,
       required: [true, 'Country is required'],
