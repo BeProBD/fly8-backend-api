@@ -55,6 +55,7 @@ const ProgramSchema = new mongoose.Schema(
         'Diploma',
         'Certificate',
         'Doctoral Program',
+        'PhD',
       ],
     },
     duration: {
