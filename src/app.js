@@ -273,6 +273,7 @@ app.use('/api/v1/public/contact', publicContactRoutes);
 app.use('/api/v1/public/success-stories', publicSuccessStoryRoutes);
 app.use('/api/v1/public/cms-events', publicCmsEventRoutes);
 app.use('/api/v1/public/offers', require('./routes/public/offers'));
+app.use('/api/v1/public/campaign-leads', require('./routes/public/campaignLeads'));
 
 // =============================================================================
 // AUTHENTICATION ROUTES
