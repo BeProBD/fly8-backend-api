@@ -26,7 +26,7 @@ exports.getUniversities = async (req, res) => {
     const [universities, total] = await Promise.all([
       University.find(filter)
         .select('universityName universitycode country location city website imageUrl createdAt')
-        .sort({ universityName: 1 })
+        .sort({ updatedAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
       University.countDocuments(filter),
