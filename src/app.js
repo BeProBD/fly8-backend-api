@@ -233,6 +233,7 @@ const adminProgramRoutes = require('./routes/admin/programs');
 const adminCountryRoutes = require('./routes/admin/countries');
 const adminBlogRoutes = require('./routes/admin/blogs');
 const adminEventRoutes = require('./routes/admin/events');
+const adminCampaignLeadRoutes = require('./routes/admin/campaignLeads');
 
 // Editor CMS Routes
 const editorBlogRoutes = require('./routes/editor/blogs');
@@ -317,6 +318,7 @@ app.use('/api/v1/admin/countries', adminCountryRoutes);
 app.use('/api/v1/admin/blogs', adminBlogRoutes);
 app.use('/api/v1/admin/events', adminEventRoutes);
 app.use('/api/v1/admin/reports', reportsRoutes);
+app.use('/api/v1/admin/campaign-leads', adminCampaignLeadRoutes);
 app.use('/api/v1/admin/settings', settingsRoutes);
 app.use('/api/v1/admin/dashboard', dashboardRoutes);
 
