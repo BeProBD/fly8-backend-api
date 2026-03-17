@@ -31,6 +31,10 @@ if (!IS_VERCEL) {
 const app = express();
 const PORT = process.env.PORT || 8001;
 
+// Required for Vercel (and any reverse-proxy deployment) so that
+// express-rate-limit can read X-Forwarded-For reliably.
+app.set('trust proxy', 1);
+
 // Only create HTTP server and Socket.io in non-serverless environments
 // Vercel is stateless — WebSockets/Socket.io cannot work there
 let server;
@@ -48,6 +52,7 @@ cloudinaryConnect();
 // =============================================================================
 const allowedOrigins = [
   // Production domains
+  'https://fly8.global',
   'https://www.fly8.global',
   'https://app.fly8.global',
   // Vercel deployments
@@ -136,6 +141,13 @@ const publicLimiter = rateLimit({
 // =============================================================================
 // MIDDLEWARE
 // =============================================================================
+
+// Ensure DB is connected before every request (critical for Vercel cold starts)
+app.use(async (_req, _res, next) => {
+  await connectDB();
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
@@ -178,20 +190,49 @@ const MONGO_URL =
   'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'fly8_production';
 
-mongoose
-  .connect(`${MONGO_URL}/${DB_NAME}`)
-  .then(async () => {
-    console.log('✅ MongoDB Connected Successfully');
-    console.log(`   Database: ${DB_NAME}`);
+// Serverless-safe connection: cache the promise in the global scope so that
+// Vercel function invocations reuse an existing connection instead of opening
+// a new one on every cold start.
+let cachedDbPromise = global._mongoosePromise || null;
 
-    // Bootstrap Super Admin on startup
-    try {
-      await ensureSuperAdminExists();
-    } catch (error) {
-      console.error('⚠️  Super Admin bootstrap warning:', error.message);
-    }
-  })
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+const connectDB = async () => {
+  if (mongoose.connection.readyState === 1) return; // already connected
+
+  if (!cachedDbPromise) {
+    cachedDbPromise = mongoose
+      .connect(`${MONGO_URL}/${DB_NAME}`, {
+        serverSelectionTimeoutMS: 30000,
+        socketTimeoutMS: 45000,
+        connectTimeoutMS: 30000,
+        maxPoolSize: 10,
+      })
+      .then(async (conn) => {
+        console.log('✅ MongoDB Connected Successfully');
+        console.log(`   Database: ${DB_NAME}`);
+        try {
+          await ensureSuperAdminExists();
+        } catch (error) {
+          console.error('⚠️  Super Admin bootstrap warning:', error.message);
+        }
+        return conn;
+      });
+
+    // Persist across warm invocations on Vercel
+    global._mongoosePromise = cachedDbPromise;
+  }
+
+  try {
+    await cachedDbPromise;
+  } catch (err) {
+    // Reset cache so the next request retries the connection
+    cachedDbPromise = null;
+    global._mongoosePromise = null;
+    console.error('❌ MongoDB Connection Error:', err);
+  }
+};
+
+// Connect immediately on startup (traditional servers); also called per-request below
+connectDB();
 
 // =============================================================================
 // IMPORT ROUTES (from src/ structure)
