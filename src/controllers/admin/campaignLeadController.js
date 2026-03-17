@@ -151,6 +151,23 @@ exports.updateCampaignLead = async (req, res) => {
 };
 
 /**
+ * DELETE /api/v1/admin/campaign-leads/:id
+ * Permanently delete a single campaign lead.
+ */
+exports.deleteCampaignLead = async (req, res) => {
+  try {
+    const lead = await CampaignLead.findByIdAndDelete(req.params.id).lean();
+    if (!lead) {
+      return res.status(404).json({ success: false, message: 'Lead not found' });
+    }
+    return res.status(200).json({ success: true, message: 'Lead deleted successfully' });
+  } catch (error) {
+    console.error('Admin delete lead error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+/**
  * GET /api/v1/admin/campaign-leads/export
  * Download filtered leads as an Excel (.xlsx) file.
  */

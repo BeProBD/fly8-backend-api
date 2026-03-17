@@ -10,6 +10,7 @@ const {
   getCampaignLeads,
   getCampaignLeadById,
   updateCampaignLead,
+  deleteCampaignLead,
   exportCampaignLeads,
   getServiceTypeStats,
 } = require('../../controllers/admin/campaignLeadController');
@@ -28,5 +29,8 @@ router.get('/:id', ...protect, getCampaignLeadById);
 
 // PATCH /api/v1/admin/campaign-leads/:id
 router.patch('/:id', ...protect, updateCampaignLead);
+
+// DELETE /api/v1/admin/campaign-leads/:id
+router.delete('/:id', ...protect, deleteCampaignLead);
 
 module.exports = router;

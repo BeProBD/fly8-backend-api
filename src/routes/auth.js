@@ -5,6 +5,16 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Student = require('../models/Student');
 const { authMiddleware, JWT_SECRET, getDashboardUrl } = require('../middlewares/auth');
+
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'fly8-refresh-secret-change-in-production';
+
+const REFRESH_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  path: '/api/v1/auth/refresh',
+  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+};
 const { validate, authSchemas } = require('../middlewares/validation');
 const { logAudit } = require('../utils/auditLogger');
 
@@ -50,10 +60,16 @@ router.post('/signup', validate(authSchemas.register), async (req, res) => {
     }
 
     const token = jwt.sign({ userId: user.userId, role: user.role }, JWT_SECRET, {
+      expiresIn: '15m'
+    });
+
+    const refreshToken = jwt.sign({ userId: user.userId }, JWT_REFRESH_SECRET, {
       expiresIn: '7d'
     });
 
     const dashboardUrl = getDashboardUrl(user.role);
+
+    res.cookie('refreshToken', refreshToken, REFRESH_COOKIE_OPTIONS);
 
     res.status(201).json({
       message: 'User created successfully',
@@ -99,8 +115,14 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     await logAudit(user.userId, 'user_login', 'user', user.userId, { email }, req);
 
     const token = jwt.sign({ userId: user.userId, role: user.role }, JWT_SECRET, {
+      expiresIn: '15m'
+    });
+
+    const refreshToken = jwt.sign({ userId: user.userId }, JWT_REFRESH_SECRET, {
       expiresIn: '7d'
     });
+
+    res.cookie('refreshToken', refreshToken, REFRESH_COOKIE_OPTIONS);
 
     const dashboardUrl = getDashboardUrl(user.role);
 
@@ -172,6 +194,43 @@ router.get('/me', authMiddleware, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch user' });
   }
+});
+
+// Refresh access token using HTTP-only refresh token cookie
+router.post('/refresh', async (req, res) => {
+  const refreshToken = req.cookies?.refreshToken;
+
+  if (!refreshToken) {
+    return res.status(401).json({ error: 'No refresh token' });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+
+    // Confirm user still exists and is active
+    const user = await User.findOne({ userId: decoded.userId }).select('userId role isActive');
+    if (!user || !user.isActive) {
+      return res.status(401).json({ error: 'User not found or inactive' });
+    }
+
+    const newAccessToken = jwt.sign(
+      { userId: user.userId, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    return res.json({ token: newAccessToken });
+  } catch {
+    // Clear the invalid cookie so the browser doesn't retry it forever
+    res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
+  }
+});
+
+// Logout — clears the refresh token cookie
+router.post('/logout', (req, res) => {
+  res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
+  return res.json({ message: 'Logged out successfully' });
 });
 
 module.exports = router;

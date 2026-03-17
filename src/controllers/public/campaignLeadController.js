@@ -4,6 +4,39 @@
  */
 
 const CampaignLead = require('../../models/CampaignLead');
+const { sendEmail } = require('../../utils/emailService');
+const { buildLeadNotificationHtml } = require('../../utils/campaignLeadEmailTemplate');
+
+// Primary recipient always receives lead notifications
+const LEAD_NOTIFY_EMAIL = process.env.MAIL_LEAD_NOTIFY || 'contact.beprobd@gmail.com';
+
+/**
+ * Fire-and-forget: send email notification after a lead is saved.
+ * Errors are logged but never bubble up to the HTTP response.
+ */
+const sendLeadNotificationEmail = (lead) => {
+  try {
+    // Build recipient list: always include primary; add lead email if present
+    const recipients = [LEAD_NOTIFY_EMAIL];
+    if (lead.contactInfo?.email) {
+      recipients.push(lead.contactInfo.email);
+    }
+
+    const html = buildLeadNotificationHtml(lead);
+
+    // Non-blocking: do not await — response returns immediately
+    sendEmail({
+      to: recipients,
+      subject: 'New Fly8 Campaign Lead',
+      html,
+    }).catch((err) =>
+      console.error('❌ [campaignLead] Background email error:', err.message)
+    );
+  } catch (err) {
+    // Template/setup errors should never crash the request
+    console.error('❌ [campaignLead] Email notification setup failed:', err.message);
+  }
+};
 
 /**
  * Submit a campaign lead
@@ -83,6 +116,9 @@ exports.submitCampaignLead = async (req, res) => {
       source: 'facebook_campaign',
       status: 'new',
     });
+
+    // Send notification email (non-blocking — does not delay response)
+    sendLeadNotificationEmail(lead);
 
     return res.status(201).json({
       success: true,
