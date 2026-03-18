@@ -12,8 +12,16 @@ const REFRESH_COOKIE_OPTIONS = {
   httpOnly: true,
   secure: process.env.NODE_ENV === 'production',
   sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-  path: '/api/v1/auth/refresh',
+  path: '/',                         // '/' = sent to ALL routes on the backend domain
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+};
+
+// clearCookie must NOT include maxAge (Express v4 deprecation + doesn't clear correctly)
+const REFRESH_COOKIE_CLEAR_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  path: '/',
 };
 const { validate, authSchemas } = require('../middlewares/validation');
 const { logAudit } = require('../utils/auditLogger');
@@ -222,14 +230,14 @@ router.post('/refresh', async (req, res) => {
     return res.json({ token: newAccessToken });
   } catch {
     // Clear the invalid cookie so the browser doesn't retry it forever
-    res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
+    res.clearCookie('refreshToken', REFRESH_COOKIE_CLEAR_OPTIONS);
     return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 });
 
 // Logout — clears the refresh token cookie
 router.post('/logout', (req, res) => {
-  res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
+  res.clearCookie('refreshToken', REFRESH_COOKIE_CLEAR_OPTIONS);
   return res.json({ message: 'Logged out successfully' });
 });
 

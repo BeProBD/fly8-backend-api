@@ -72,13 +72,18 @@ const allowedOrigins = [
   ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : []),
 ];
 
+// Matches any Vercel preview deployment for this project's own frontend apps.
+// Format: fly8-(marketing|dashboard)-frontend[-<hash>][-<slug>].vercel.app
+const isOwnVercelPreview = (origin) =>
+  /^https:\/\/fly8-(marketing|dashboard)-frontend(-[a-z0-9]+)*\.vercel\.app$/.test(origin);
+
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
+    // Allow requests with no origin (mobile apps, Postman, curl, etc.)
     if (!origin) {
       return callback(null, true);
     }
-    if (allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin) || isOwnVercelPreview(origin)) {
       callback(null, true);
     } else {
       console.warn(`CORS blocked origin: ${origin}`);
