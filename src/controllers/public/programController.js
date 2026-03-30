@@ -39,7 +39,17 @@ exports.getAllPrograms = async (req, res) => {
     const filter = { isActive: { $ne: false } };
 
     if (country) {
-      filter.country = { $regex: new RegExp(country, 'i') };
+      const normalizedCountry = country.toLowerCase().trim();
+      const variations = countryMappings[normalizedCountry];
+      if (variations && variations.length > 0) {
+        // Build an OR regex from all known variations (anchored, case-insensitive)
+        const regexParts = variations.map(v =>
+          `^${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`
+        );
+        filter.country = { $regex: new RegExp(regexParts.join('|'), 'i') };
+      } else {
+        filter.country = { $regex: new RegExp(country, 'i') };
+      }
     }
     if (universityName) {
       filter.universityName = { $regex: new RegExp(universityName, 'i') };
