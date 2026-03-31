@@ -71,7 +71,7 @@ exports.createProgram = async (req, res) => {
     body = await resolveUniversityFields(body, res);
     if (!body) return; // university not found – response already sent
 
-    const required = ['country', 'universityName', 'location', 'programName', 'majors', 'programLevel', 'duration', 'intake'];
+    const required = ['country', 'universityName', 'location', 'programName', 'programLevel', 'duration', 'intake'];
     for (const field of required) {
       if (!body[field]) {
         return res.status(400).json({ success: false, message: `${field} is required` });

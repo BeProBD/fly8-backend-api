@@ -41,7 +41,6 @@ const ProgramSchema = new mongoose.Schema(
     },
     majors: {
       type: String,
-      required: [true, 'Majors are required'],
       trim: true,
     },
     programLevel: {
