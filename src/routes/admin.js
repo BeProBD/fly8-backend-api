@@ -14,6 +14,8 @@ const ServiceRequest = require('../models/ServiceRequest');
 const ServiceApplication = require('../models/ServiceApplication');
 const Notification = require('../models/Notification');
 const Commission = require('../models/Commission');
+const Task = require('../models/Task');
+const Message = require('../models/Message');
 const { logAudit, logAssignmentEvent } = require('../utils/auditLogger');
 const { emitToUser } = require('../socket/socketManager');
 const notificationService = require('../services/notificationService');
@@ -1504,6 +1506,46 @@ router.patch('/service-requests/:requestId/status', authMiddleware, roleMiddlewa
   } catch (error) {
     console.error('Update status error:', error);
     res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+/**
+ * @route   DELETE /api/admin/service-requests/:requestId
+ * @desc    Permanently delete a service request and all related data
+ * @access  Super Admin
+ */
+router.delete('/service-requests/:requestId', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const serviceRequest = await ServiceRequest.findOne({ serviceRequestId: requestId });
+    if (!serviceRequest) {
+      return res.status(404).json({ error: 'Service request not found' });
+    }
+
+    // Cascade delete all related data in parallel
+    await Promise.all([
+      Task.deleteMany({ serviceRequestId: requestId }),
+      Message.deleteMany({ serviceRequestId: requestId }),
+      Commission.deleteMany({ serviceRequestId: requestId }),
+      Notification.deleteMany({ 'metadata.serviceRequestId': requestId }),
+    ]);
+
+    await ServiceRequest.deleteOne({ serviceRequestId: requestId });
+
+    await logAudit(
+      req.user.userId,
+      'service_request_deleted',
+      'serviceRequest',
+      requestId,
+      { serviceType: serviceRequest.serviceType, studentId: serviceRequest.studentId },
+      req
+    );
+
+    res.json({ message: 'Service request and all related data deleted successfully' });
+  } catch (error) {
+    console.error('Delete service request error:', error);
+    res.status(500).json({ error: 'Failed to delete service request' });
   }
 });
 

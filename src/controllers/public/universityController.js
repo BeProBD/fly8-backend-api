@@ -42,6 +42,7 @@ exports.getAllUniversities = async (req, res) => {
       filter.$or = [
         { universityName: { $regex: search, $options: 'i' } },
         { universitycode: { $regex: search, $options: 'i' } },
+        { country: { $regex: search, $options: 'i' } },
         { location: { $regex: search, $options: 'i' } },
       ];
     }
