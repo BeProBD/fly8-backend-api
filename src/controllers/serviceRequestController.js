@@ -11,17 +11,29 @@ const { getRoleBasedFilter } = require('../middlewares/auth');
 const notificationService = require('../services/notificationService');
 const { logServiceRequestEvent, logAssignmentEvent } = require('../utils/auditLogger');
 const { emitToStudent, broadcastServiceRequestUpdate } = require('../socket/socketManager');
+const { validateFormData } = require('../utils/formDataValidator');
 
 /**
  * Create a new service request (Student only)
  */
 const createServiceRequest = async (req, res) => {
   try {
-    const { serviceType, metadata } = req.body;
+    const { serviceType, metadata, formData } = req.body;
 
     // Verify student exists
     if (!req.student) {
       return res.status(400).json({ error: 'Student record not found' });
+    }
+
+    // Validate formData if provided
+    if (formData) {
+      const validation = validateFormData(serviceType, formData);
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: 'Invalid form data',
+          errors: validation.errors
+        });
+      }
     }
 
     // Check if service request already exists for this service type
@@ -50,6 +62,8 @@ const createServiceRequest = async (req, res) => {
       serviceType,
       status: 'PENDING_ADMIN_ASSIGNMENT',
       metadata: metadata || {},
+      formData: formData || null,
+      formSubmittedAt: formData ? new Date() : null,
       appliedAt: new Date()
     });
 

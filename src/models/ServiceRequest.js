@@ -141,6 +141,16 @@ const serviceRequestSchema = new mongoose.Schema({
     default: {}
   },
 
+  // Pre-application form data (structured input from student)
+  formData: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  formSubmittedAt: {
+    type: Date,
+    default: null
+  },
+
   // Timestamps
   appliedAt: {
     type: Date,
