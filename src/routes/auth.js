@@ -60,6 +60,7 @@ router.post('/signup', validate(authSchemas.register), async (req, res) => {
         studentId,
         userId,
         interestedCountries: [],
+        interestedServices: [],
         selectedServices: [],
         onboardingCompleted: false,
         status: 'active'
@@ -142,7 +143,9 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         studentData = {
           studentId: student.studentId,
           onboardingCompleted: student.onboardingCompleted,
-          selectedServices: student.selectedServices
+          interestedServices: student.interestedServices || [],
+          selectedServices: student.selectedServices,
+          interactionMode: student.interactionMode || 'student-counselor'
         };
       }
     }
@@ -180,8 +183,10 @@ router.get('/me', authMiddleware, async (req, res) => {
       studentData = {
         studentId: req.student.studentId,
         onboardingCompleted: req.student.onboardingCompleted,
+        interestedServices: req.student.interestedServices || [],
         selectedServices: req.student.selectedServices,
-        status: req.student.status
+        status: req.student.status,
+        interactionMode: req.student.interactionMode || 'student-counselor'
       };
     }
 

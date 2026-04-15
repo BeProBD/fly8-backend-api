@@ -14,16 +14,24 @@ const Student = require('../models/Student');
 const { emitToUser, emitToServiceRequest } = require('../socket/socketManager');
 
 /**
- * Helper: Check if user has access to chat for a service request
+ * Helper: Check if user has access to chat for a service request.
+ * Enforces interactionMode:
+ *   - 'rep-counselor': only representative + counselor + admin can chat (student blocked)
+ *   - 'student-counselor' / null: only student + counselor + agent + admin can chat (rep blocked)
  */
 async function checkChatAccess(user, serviceRequest) {
+  const mode = serviceRequest.interactionMode; // 'rep-counselor' | 'student-counselor' | null
+
   switch (user.role) {
     case 'super_admin':
       return true;
 
-    case 'student':
+    case 'student': {
+      // In rep-counselor mode, student cannot access chat directly
+      if (mode === 'rep-counselor') return false;
       const student = await Student.findOne({ userId: user.userId });
       return student && serviceRequest.studentId === student.studentId;
+    }
 
     case 'counselor':
       return serviceRequest.assignedCounselor === user.userId;
@@ -31,26 +39,45 @@ async function checkChatAccess(user, serviceRequest) {
     case 'agent':
       return serviceRequest.assignedAgent === user.userId;
 
+    case 'rep3':
+      // Rep3 can chat only in rep-counselor mode for their own service requests
+      return mode === 'rep-counselor' && serviceRequest.representativeId === user.userId;
+
+    case 'rep1':
+    case 'rep2':
+      // Rep1/Rep2 can view chat (read-only) in rep-counselor mode for their linked requests
+      return mode === 'rep-counselor' && serviceRequest.representativeId === user.userId;
+
     default:
       return false;
   }
 }
 
 /**
- * Helper: Emit chat message to all participants
+ * Helper: Emit chat message to all participants.
+ * Respects interactionMode to determine who receives notifications.
  */
 async function emitChatMessage(serviceRequest, message, excludeUserId) {
-  // Get student userId
-  const student = await Student.findOne({ studentId: serviceRequest.studentId });
+  const mode = serviceRequest.interactionMode;
+  const participants = [];
 
-  const participants = [
-    student?.userId,
-    serviceRequest.assignedCounselor,
-    serviceRequest.assignedAgent
-  ].filter(id => id && id !== excludeUserId);
+  if (mode === 'rep-counselor') {
+    // In rep-counselor mode: representative + counselor (student excluded from chat)
+    if (serviceRequest.representativeId) participants.push(serviceRequest.representativeId);
+    if (serviceRequest.assignedCounselor) participants.push(serviceRequest.assignedCounselor);
+    if (serviceRequest.assignedAgent) participants.push(serviceRequest.assignedAgent);
+  } else {
+    // In student-counselor or default mode: student + counselor + agent
+    const student = await Student.findOne({ studentId: serviceRequest.studentId });
+    if (student?.userId) participants.push(student.userId);
+    if (serviceRequest.assignedCounselor) participants.push(serviceRequest.assignedCounselor);
+    if (serviceRequest.assignedAgent) participants.push(serviceRequest.assignedAgent);
+  }
 
-  // Emit to each participant
-  participants.forEach(userId => {
+  // Deduplicate and exclude sender
+  const uniqueParticipants = [...new Set(participants)].filter(id => id !== excludeUserId);
+
+  uniqueParticipants.forEach(userId => {
     emitToUser(userId, 'new_chat_message', {
       serviceRequestId: serviceRequest.serviceRequestId,
       message
@@ -160,6 +187,11 @@ router.post('/:serviceRequestId/messages', authMiddleware, async (req, res) => {
     const hasAccess = await checkChatAccess(req.user, serviceRequest);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Rep1/Rep2 can only view chat, not send messages
+    if (req.user.role === 'rep1' || req.user.role === 'rep2') {
+      return res.status(403).json({ error: 'Read-only access — representatives at this level cannot send messages' });
     }
 
     // Check if chat is enabled
@@ -323,12 +355,21 @@ router.get('/:serviceRequestId/participants', authMiddleware, async (req, res) =
           .lean()
       : null;
 
+    // Get representative info (if rep-counselor mode)
+    const representative = serviceRequest.representativeId
+      ? await User.findOne({ userId: serviceRequest.representativeId })
+          .select('userId firstName lastName avatar role email')
+          .lean()
+      : null;
+
     res.json({
       participants: {
         student: studentUser,
         counselor,
-        agent
+        agent,
+        representative
       },
+      interactionMode: serviceRequest.interactionMode || null,
       chatEnabled: serviceRequest.status !== 'PENDING_ADMIN_ASSIGNMENT'
     });
 

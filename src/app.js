@@ -243,6 +243,9 @@ connectDB();
 // IMPORT ROUTES (from src/ structure)
 // =============================================================================
 
+// Register event listeners (commission, audit side-effects)
+require('./events/listeners');
+
 // Dashboard Routes (Protected - Auth Required)
 const authRoutes = require('./routes/auth');
 const studentRoutes = require('./routes/students');
@@ -251,6 +254,8 @@ const serviceRequestRoutes = require('./routes/serviceRequests');
 const taskRoutes = require('./routes/tasks');
 const counselorRoutes = require('./routes/counselors');
 const agentRoutes = require('./routes/agents');
+const representativeRoutes = require('./routes/representatives');
+const partnerRoutes = require('./routes/partners');
 const adminRoutes = require('./routes/admin');
 const notificationRoutes = require('./routes/notifications');
 const paymentRoutes = require('./routes/payments');
@@ -336,6 +341,8 @@ app.use('/api/v1/service-requests', serviceRequestRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/counselors', counselorRoutes);
 app.use('/api/v1/agents', agentRoutes);
+app.use('/api/v1/representatives', representativeRoutes);
+app.use('/api/v1/partners', partnerRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/audit', auditRoutes);
@@ -428,54 +435,75 @@ app.use((req, res, next) => {
   });
 });
 
-// Global Error Handler
+// Global Error Handler — standardized response format
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
+  // Log non-operational errors fully, operational ones briefly
+  if (err.isOperational) {
+    console.error(`[${err.code || 'ERROR'}] ${err.message}`);
+  } else {
+    console.error('Unhandled Error:', err);
+  }
+
+  // Custom AppError (ForbiddenError, NotFoundError, etc.)
+  if (err.isOperational) {
+    return res.status(err.statusCode).json({
+      success: false,
+      message: err.message,
+      code: err.code
+    });
+  }
 
   // Handle CORS errors
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({
       success: false,
-      error: 'CORS policy violation',
+      message: 'CORS policy violation',
+      code: 'CORS_ERROR'
     });
   }
 
-  // Handle specific error types
+  // Mongoose ValidationError
   if (err.name === 'ValidationError') {
     return res.status(400).json({
       success: false,
-      error: 'Validation Error',
-      details: err.message,
+      message: err.message,
+      code: 'VALIDATION_ERROR'
     });
   }
 
+  // JWT errors
   if (err.name === 'JsonWebTokenError') {
     return res.status(401).json({
       success: false,
-      error: 'Invalid token',
+      message: 'Invalid token',
+      code: 'INVALID_TOKEN'
     });
   }
 
   if (err.name === 'TokenExpiredError') {
     return res.status(401).json({
       success: false,
-      error: 'Token expired',
-      code: 'TOKEN_EXPIRED',
+      message: 'Token expired',
+      code: 'TOKEN_EXPIRED'
     });
   }
 
+  // Mongoose duplicate key
   if (err.code === 11000) {
     return res.status(409).json({
       success: false,
-      error: 'Duplicate entry',
-      details: err.message,
+      message: 'Duplicate entry',
+      code: 'DUPLICATE_ENTRY'
     });
   }
 
-  // Generic error response
+  // Generic — never leak internal details in production
   res.status(err.status || 500).json({
     success: false,
-    error: err.message || 'Internal Server Error',
+    message: process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : (err.message || 'Internal server error'),
+    code: 'INTERNAL_ERROR'
   });
 });
 

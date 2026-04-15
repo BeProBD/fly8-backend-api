@@ -75,15 +75,39 @@ router.get('/dashboard', authMiddleware, roleMiddleware('counselor'), async (req
  */
 router.get('/students', authMiddleware, roleMiddleware('counselor'), async (req, res) => {
   try {
-    const students = await Student.find({ assignedCounselor: req.user.userId })
-      .sort({ createdAt: -1 })
-      .lean();
+    const counselorId = req.user.userId;
+
+    // Students directly assigned to this counselor
+    const directStudents = await Student.find({ assignedCounselor: counselorId }).lean();
+
+    // Students reached via service requests assigned to this counselor
+    // (covers partner-managed rep-counselor cases where Student.assignedCounselor is not set)
+    const srStudentIds = await ServiceRequest.find({ assignedCounselor: counselorId })
+      .distinct('studentId');
+
+    const directIds = new Set(directStudents.map(s => s.studentId));
+    const extraIds = srStudentIds.filter(id => !directIds.has(id));
+    const extraStudents = extraIds.length
+      ? await Student.find({ studentId: { $in: extraIds } }).lean()
+      : [];
+
+    const students = [...directStudents, ...extraStudents].sort(
+      (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+    );
 
     const studentsWithDetails = await Promise.all(
       students.map(async (student) => {
         const user = await User.findOne({ userId: student.userId }).select('-password').lean();
         const serviceRequests = await ServiceRequest.find({ studentId: student.studentId }).lean();
-        const tasks = await Task.find({ assignedTo: student.userId, assignedBy: req.user.userId }).lean();
+        // Tasks for this student's service requests that this counselor created —
+        // match by serviceRequestId (covers both student- and partner-assigned tasks).
+        const srIds = serviceRequests.map(sr => sr.serviceRequestId);
+        const tasks = srIds.length
+          ? await Task.find({
+              serviceRequestId: { $in: srIds },
+              assignedBy: counselorId,
+            }).lean()
+          : [];
 
         return {
           ...student,
@@ -91,7 +115,8 @@ router.get('/students', authMiddleware, roleMiddleware('counselor'), async (req,
           serviceRequests,
           tasks,
           activeRequests: serviceRequests.filter(sr => ['ASSIGNED', 'IN_PROGRESS'].includes(sr.status)).length,
-          pendingTasks: tasks.filter(t => ['PENDING', 'SUBMITTED', 'UNDER_REVIEW'].includes(t.status)).length
+          pendingTasks: tasks.filter(t => ['PENDING', 'SUBMITTED', 'UNDER_REVIEW'].includes(t.status)).length,
+          isPartnerManaged: student.interactionMode === 'rep-counselor',
         };
       })
     );
@@ -124,17 +149,27 @@ router.get('/service-requests', authMiddleware, roleMiddleware('counselor'), asy
 
     const total = await ServiceRequest.countDocuments(filter);
 
-    // Enrich with student and task data
+    // Enrich with student, partner, and task data
     const enrichedRequests = await Promise.all(
       serviceRequests.map(async (request) => {
         const student = await Student.findOne({ studentId: request.studentId }).lean();
         const user = student ? await User.findOne({ userId: student.userId }).select('-password').lean() : null;
         const tasks = await Task.find({ serviceRequestId: request.serviceRequestId }).lean();
 
+        // Surface the partner (rep3) when the case is partner-managed
+        let partner = null;
+        if (request.representativeId) {
+          partner = await User.findOne({ userId: request.representativeId })
+            .select('userId firstName lastName email avatar phone')
+            .lean();
+        }
+
         return {
           ...request,
           requestId: request.serviceRequestId,
-          student: { ...student, user },
+          student: student ? { ...student, user } : null,
+          partner,
+          isPartnerManaged: request.interactionMode === 'rep-counselor',
           tasks,
           taskStats: {
             total: tasks.length,

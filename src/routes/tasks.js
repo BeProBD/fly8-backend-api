@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const { authMiddleware, roleMiddleware } = require('../middlewares/auth');
+const { enforceStudentInteractionMode } = require('../middlewares/interactionMode');
 const {
   createTask,
   getTasks,
@@ -55,7 +56,8 @@ router.get('/:taskId',
  */
 router.post('/:taskId/submit',
   authMiddleware,
-  roleMiddleware('student'),
+  roleMiddleware('student', 'rep3'),
+  enforceStudentInteractionMode,
   submitTask
 );
 

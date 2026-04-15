@@ -16,10 +16,12 @@ const Notification = require('../models/Notification');
 const Commission = require('../models/Commission');
 const Task = require('../models/Task');
 const Message = require('../models/Message');
-const { logAudit, logAssignmentEvent } = require('../utils/auditLogger');
+const { logAudit, logAssignmentEvent, createAuditLog } = require('../utils/auditLogger');
 const { emitToUser } = require('../socket/socketManager');
 const notificationService = require('../services/notificationService');
 const StudentNote = require('../models/StudentNote');
+const Representative = require('../models/Representative');
+const PaymentRequest = require('../models/PaymentRequest');
 
 /**
  * @route   GET /api/admin/metrics
@@ -1307,12 +1309,19 @@ router.get('/service-requests', authMiddleware, roleMiddleware('super_admin'), a
           assignedAgent = await User.findOne({ userId: request.assignedAgent }).select('-password').lean();
         }
 
+        // Enrich representative data if present
+        let representative = null;
+        if (request.representativeId) {
+          representative = await User.findOne({ userId: request.representativeId }).select('userId firstName lastName role representativeLevel').lean();
+        }
+
         return {
           ...request,
           requestId: request.serviceRequestId,
           student: { ...student, user: studentUser },
           assignedCounselor,
-          assignedAgent
+          assignedAgent,
+          representative
         };
       })
     );
@@ -1754,22 +1763,34 @@ router.post('/commissions/:commissionId/payout', authMiddleware, roleMiddleware(
     if (commission.status !== 'approved') return res.status(400).json({ error: 'Commission must be approved before payout' });
 
     const { generateInvoiceNumber, updateAgentEarnings } = require('../services/commissionService');
+    const mongoose = require('mongoose');
 
-    commission.status = 'paid';
-    commission.paidAt = new Date();
-    commission.processedBy = req.user.userId;
-    commission.payoutReference = externalReference || '';
-    if (!commission.invoiceNumber) {
-      commission.invoiceNumber = await generateInvoiceNumber();
+    // Transaction: commission payout + earnings update must be atomic
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      commission.status = 'paid';
+      commission.paidAt = new Date();
+      commission.processedBy = req.user.userId;
+      commission.payoutReference = externalReference || '';
+      if (!commission.invoiceNumber) {
+        commission.invoiceNumber = await generateInvoiceNumber();
+      }
+      commission.statusHistory.push({
+        status: 'paid',
+        changedBy: req.user.userId,
+        changedAt: new Date(),
+        note: 'Payout processed by admin'
+      });
+      await commission.save({ session });
+      await updateAgentEarnings(commission.agentId);
+      await session.commitTransaction();
+    } catch (txErr) {
+      await session.abortTransaction();
+      throw txErr;
+    } finally {
+      session.endSession();
     }
-    commission.statusHistory.push({
-      status: 'paid',
-      changedBy: req.user.userId,
-      changedAt: new Date(),
-      note: 'Payout processed by admin'
-    });
-    await commission.save();
-    await updateAgentEarnings(commission.agentId);
 
     await logAudit(req.user.userId, 'commission_paid', 'commission', commissionId, { amount: commission.amount, agentId: commission.agentId }, req);
 
@@ -2659,5 +2680,920 @@ router.post('/agent-requests/:requestId/reject', authMiddleware, roleMiddleware(
     res.status(500).json({ success: false, error: 'Failed to reject agent request' });
   }
 });
+
+// =============================================================================
+// REPRESENTATIVE MANAGEMENT
+// =============================================================================
+
+/**
+ * @route   GET /api/admin/representatives/stats
+ * @desc    Get representative statistics for dashboard
+ * @access  Super Admin
+ */
+router.get('/representatives/stats', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+    const [total, active, inactive, byType] = await Promise.all([
+      User.countDocuments({ role: { $in: repRoles }, isActive: { $ne: false } }),
+      User.countDocuments({ role: { $in: repRoles }, isActive: true }),
+      User.countDocuments({ role: { $in: repRoles }, isActive: false }),
+      User.aggregate([
+        { $match: { role: { $in: repRoles } } },
+        { $group: { _id: '$role', count: { $sum: 1 } } }
+      ])
+    ]);
+
+    const typeCounts = { rep1: 0, rep2: 0, rep3: 0 };
+    byType.forEach(t => { typeCounts[t._id] = t.count; });
+
+    // Students linked to representatives
+    const totalStudentsManaged = await Student.countDocuments({
+      $or: [
+        { referredBy: { $ne: null } },
+        { assignedAgent: { $ne: null } },
+        { createdByRep: { $ne: null } }
+      ]
+    });
+
+    // Commission stats for representatives
+    const commissionStats = await Commission.aggregate([
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'agentId',
+          foreignField: 'userId',
+          as: 'agent'
+        }
+      },
+      { $unwind: '$agent' },
+      { $match: { 'agent.role': { $in: repRoles } } },
+      {
+        $group: {
+          _id: '$status',
+          total: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    let totalCommissionsPaid = 0;
+    let pendingCommissions = 0;
+    commissionStats.forEach(s => {
+      if (s._id === 'paid') totalCommissionsPaid = s.total;
+      if (s._id === 'pending' || s._id === 'approved') pendingCommissions += s.total;
+    });
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const recentlyAdded = await User.countDocuments({
+      role: { $in: repRoles },
+      createdAt: { $gte: thirtyDaysAgo }
+    });
+
+    res.json({
+      stats: {
+        total,
+        active,
+        inactive,
+        typeCounts,
+        totalStudentsManaged,
+        totalCommissionsPaid,
+        pendingCommissions,
+        recentlyAdded
+      }
+    });
+  } catch (error) {
+    console.error('Get representative stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch representative statistics' });
+  }
+});
+
+/**
+ * @route   GET /api/admin/representatives
+ * @desc    Get all representatives with pagination and filters
+ * @access  Super Admin
+ */
+router.get('/representatives', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 12,
+      search = '',
+      status = 'all',
+      repType = 'all',
+      sortBy = 'createdAt',
+      order = 'desc'
+    } = req.query;
+
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+    const query = { role: { $in: repRoles } };
+
+    if (status === 'active') query.isActive = true;
+    else if (status === 'inactive') query.isActive = false;
+
+    if (repType !== 'all' && repRoles.includes(repType)) {
+      query.role = repType;
+    }
+
+    if (search) {
+      query.$or = [
+        { firstName: { $regex: search, $options: 'i' } },
+        { lastName: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [reps, total] = await Promise.all([
+      User.find(query)
+        .select('-password')
+        .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      User.countDocuments(query)
+    ]);
+
+    // Enrich with profile data and metrics
+    const enrichedReps = await Promise.all(
+      reps.map(async (rep) => {
+        const [profile, totalStudents, referredStudents, commissionAgg] = await Promise.all([
+          Representative.findOne({ userId: rep.userId }).lean(),
+          Student.countDocuments({
+            $or: [
+              { assignedAgent: rep.userId },
+              { createdByRep: rep.userId }
+            ]
+          }),
+          Student.countDocuments({ referredBy: rep.userId }),
+          Commission.aggregate([
+            { $match: { agentId: rep.userId } },
+            { $group: { _id: '$status', total: { $sum: '$amount' } } }
+          ])
+        ]);
+
+        let totalEarnings = 0;
+        let pendingEarnings = 0;
+        commissionAgg.forEach(c => {
+          if (c._id === 'paid') totalEarnings = c.total;
+          if (c._id === 'pending' || c._id === 'approved') pendingEarnings += c.total;
+        });
+
+        const repTypeLabels = {
+          rep1: 'Internal Representative',
+          rep2: 'Senior/Regional Representative',
+          rep3: 'Partner Representative'
+        };
+
+        return {
+          ...rep,
+          _id: rep.userId,
+          profile: profile || null,
+          repTypeLabel: repTypeLabels[rep.role] || rep.role,
+          totalStudents,
+          referredStudents,
+          totalEarnings: rep.totalEarnings || totalEarnings,
+          pendingEarnings: rep.pendingEarnings || pendingEarnings,
+          commissionRate: rep.commissionPercentage || 10,
+          assignedRegion: profile?.assignedRegion || '',
+          organization: profile?.organization || '',
+          experienceLevel: profile?.experienceLevel || 'mid',
+          metrics: profile?.metrics || { totalStudentsAdded: totalStudents, activeStudents: 0, conversionRate: 0 }
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      representatives: enrichedReps,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get representatives error:', error);
+    res.status(500).json({ error: 'Failed to fetch representatives' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/representatives
+ * @desc    Create a new representative
+ * @access  Super Admin
+ */
+router.post('/representatives', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const {
+      email, password, firstName, lastName, phone, country,
+      repType, commissionPercentage = 10,
+      assignedRegion, assignedCountries, organization, experienceLevel, bio, adminNotes
+    } = req.body;
+
+    // Validation
+    if (!email || !password || !firstName || !lastName || !repType) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: email, password, firstName, lastName, repType'
+      });
+    }
+
+    const validRepTypes = ['rep1', 'rep2', 'rep3'];
+    if (!validRepTypes.includes(repType)) {
+      return res.status(400).json({ success: false, message: 'Invalid representative type. Must be rep1, rep2, or rep3' });
+    }
+
+    if (commissionPercentage < 0 || commissionPercentage > 100) {
+      return res.status(400).json({ success: false, message: 'Commission percentage must be between 0 and 100' });
+    }
+
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      return res.status(400).json({ success: false, message: 'An account with this email already exists' });
+    }
+
+    const repLevelMap = { rep1: 1, rep2: 2, rep3: 3 };
+
+    // Create User record
+    const user = new User({
+      userId: uuidv4(),
+      email: email.toLowerCase(),
+      password,
+      firstName,
+      lastName,
+      role: repType,
+      representativeLevel: repLevelMap[repType],
+      phone: phone || '',
+      country: country || '',
+      commissionPercentage,
+      avatar: `https://api.dicebear.com/5.x/initials/svg?seed=${firstName}${lastName}`,
+      isActive: true
+    });
+    await user.save();
+
+    // Create Representative profile
+    const repProfile = new Representative({
+      userId: user.userId,
+      repType,
+      assignedRegion: assignedRegion || '',
+      assignedCountries: assignedCountries || [],
+      organization: organization || '',
+      experienceLevel: experienceLevel || 'mid',
+      bio: bio || '',
+      adminNotes: adminNotes || ''
+    });
+    await repProfile.save();
+
+    await logAudit(req.user.userId, 'user_created', 'user', user.userId, {
+      role: repType,
+      email,
+      commissionPercentage,
+      organization
+    }, req);
+
+    const repTypeLabels = {
+      rep1: 'Internal Representative',
+      rep2: 'Senior/Regional Representative',
+      rep3: 'Partner Representative'
+    };
+
+    res.status(201).json({
+      success: true,
+      message: 'Representative created successfully',
+      representative: {
+        ...user.toObject(),
+        password: undefined,
+        _id: user.userId,
+        profile: repProfile.toObject(),
+        repTypeLabel: repTypeLabels[repType],
+        commissionRate: commissionPercentage
+      }
+    });
+  } catch (error) {
+    console.error('Create representative error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create representative' });
+  }
+});
+
+/**
+ * @route   GET /api/admin/representatives/:userId
+ * @desc    Get single representative by ID with full details
+ * @access  Super Admin
+ */
+router.get('/representatives/:userId', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+    const rep = await User.findOne({ userId, role: { $in: repRoles } }).select('-password').lean();
+
+    if (!rep) {
+      return res.status(404).json({ success: false, message: 'Representative not found' });
+    }
+
+    const profile = await Representative.findOne({ userId }).lean();
+
+    // Get students (assigned, referred, created by rep)
+    const [assignedStudentsData, referredStudentsData] = await Promise.all([
+      Student.find({
+        $or: [
+          { assignedAgent: userId },
+          { createdByRep: userId }
+        ]
+      }).lean(),
+      Student.find({ referredBy: userId }).lean()
+    ]);
+
+    const enrichStudent = async (student) => {
+      const user = await User.findOne({ userId: student.userId }).select('-password').lean();
+      const services = await ServiceRequest.find({ studentId: student.studentId })
+        .select('serviceType status priority appliedAt createdAt')
+        .lean();
+      return {
+        ...student,
+        user,
+        services: services.map(s => ({
+          ...s,
+          _id: s.serviceRequestId,
+          type: 'ServiceRequest',
+          assignedAt: s.appliedAt || s.createdAt
+        }))
+      };
+    };
+
+    const [assignedStudents, referredStudents] = await Promise.all([
+      Promise.all(assignedStudentsData.map(enrichStudent)),
+      Promise.all(referredStudentsData.map(enrichStudent))
+    ]);
+
+    // Commission history
+    const commissions = await Commission.find({ agentId: userId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    // Commission stats
+    const commissionStats = await Commission.aggregate([
+      { $match: { agentId: userId } },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+
+    const stats = {
+      totalStudents: assignedStudents.length,
+      referredStudents: referredStudents.length,
+      totalEarnings: 0,
+      pendingEarnings: 0,
+      paidCommissions: 0,
+      pendingCommissions: 0,
+      applicationsProcessed: profile?.metrics?.applicationsProcessed || 0,
+      conversionRate: profile?.metrics?.conversionRate || 0
+    };
+
+    commissionStats.forEach(c => {
+      if (c._id === 'paid') {
+        stats.totalEarnings = c.total;
+        stats.paidCommissions = c.count;
+      }
+      if (c._id === 'pending' || c._id === 'approved') {
+        stats.pendingEarnings += c.total;
+        stats.pendingCommissions += c.count;
+      }
+    });
+
+    // Recent audit trail
+    const AuditLog = require('../models/AuditLog');
+    const activityLog = await AuditLog.find({
+      $or: [
+        { actorUserId: userId },
+        { entityId: userId }
+      ]
+    })
+      .sort({ timestamp: -1 })
+      .limit(20)
+      .lean();
+
+    const repTypeLabels = {
+      rep1: 'Internal Representative',
+      rep2: 'Senior/Regional Representative',
+      rep3: 'Partner Representative'
+    };
+
+    res.json({
+      success: true,
+      representative: {
+        ...rep,
+        _id: rep.userId,
+        commissionRate: rep.commissionPercentage || 10,
+        repTypeLabel: repTypeLabels[rep.role] || rep.role,
+        profile: profile || null
+      },
+      assignedStudents,
+      referredStudents,
+      commissions,
+      stats,
+      activityLog
+    });
+  } catch (error) {
+    console.error('Get representative by ID error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch representative details' });
+  }
+});
+
+/**
+ * @route   PUT /api/admin/representatives/:userId
+ * @desc    Update representative profile
+ * @access  Super Admin
+ */
+router.put('/representatives/:userId', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const {
+      firstName, lastName, phone, country, avatar,
+      repType, assignedRegion, assignedCountries, organization,
+      experienceLevel, bio, adminNotes, bankDetails
+    } = req.body;
+
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+
+    // Update User record
+    const userUpdates = {};
+    if (firstName) userUpdates.firstName = firstName;
+    if (lastName) userUpdates.lastName = lastName;
+    if (phone !== undefined) userUpdates.phone = phone;
+    if (country !== undefined) userUpdates.country = country;
+    if (avatar) userUpdates.avatar = avatar;
+    if (bankDetails) userUpdates.bankDetails = bankDetails;
+
+    if (repType && repRoles.includes(repType)) {
+      userUpdates.role = repType;
+      userUpdates.representativeLevel = { rep1: 1, rep2: 2, rep3: 3 }[repType];
+    }
+
+    const rep = await User.findOneAndUpdate(
+      { userId, role: { $in: repRoles } },
+      userUpdates,
+      { new: true }
+    ).select('-password');
+
+    if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+    // Update Representative profile
+    const profileUpdates = {};
+    if (repType) profileUpdates.repType = repType;
+    if (assignedRegion !== undefined) profileUpdates.assignedRegion = assignedRegion;
+    if (assignedCountries) profileUpdates.assignedCountries = assignedCountries;
+    if (organization !== undefined) profileUpdates.organization = organization;
+    if (experienceLevel) profileUpdates.experienceLevel = experienceLevel;
+    if (bio !== undefined) profileUpdates.bio = bio;
+    if (adminNotes !== undefined) profileUpdates.adminNotes = adminNotes;
+
+    if (repType) {
+      const labels = { rep1: 'Internal Representative', rep2: 'Senior/Regional Representative', rep3: 'Partner Representative' };
+      profileUpdates.repLabel = labels[repType];
+    }
+
+    let profile = await Representative.findOneAndUpdate(
+      { userId },
+      profileUpdates,
+      { new: true, upsert: true }
+    ).lean();
+
+    await logAudit(req.user.userId, 'user_updated', 'user', userId, { ...userUpdates, ...profileUpdates }, req);
+
+    const repTypeLabels = {
+      rep1: 'Internal Representative',
+      rep2: 'Senior/Regional Representative',
+      rep3: 'Partner Representative'
+    };
+
+    res.json({
+      success: true,
+      message: 'Representative updated successfully',
+      representative: {
+        ...rep.toObject(),
+        _id: rep.userId,
+        commissionRate: rep.commissionPercentage || 10,
+        repTypeLabel: repTypeLabels[rep.role] || rep.role,
+        profile
+      }
+    });
+  } catch (error) {
+    console.error('Update representative error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update representative' });
+  }
+});
+
+/**
+ * @route   PATCH /api/admin/representatives/:userId/status
+ * @desc    Update representative status (activate/deactivate)
+ * @access  Super Admin
+ */
+router.patch('/representatives/:userId/status', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { isActive } = req.body;
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'isActive must be a boolean' });
+    }
+
+    const rep = await User.findOneAndUpdate(
+      { userId, role: { $in: repRoles } },
+      { isActive },
+      { new: true }
+    ).select('-password');
+
+    if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+    await logAudit(req.user.userId, isActive ? 'user_activated' : 'user_deactivated', 'user', userId, { isActive }, req);
+
+    res.json({
+      success: true,
+      message: `Representative ${isActive ? 'activated' : 'deactivated'} successfully`,
+      representative: { ...rep.toObject(), _id: rep.userId, commissionRate: rep.commissionPercentage || 10 }
+    });
+  } catch (error) {
+    console.error('Update representative status error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update representative status' });
+  }
+});
+
+/**
+ * @route   PATCH /api/admin/representatives/:userId/commission
+ * @desc    Update representative commission percentage
+ * @access  Super Admin
+ */
+router.patch('/representatives/:userId/commission', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { commissionPercentage } = req.body;
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+
+    if (typeof commissionPercentage !== 'number' || commissionPercentage < 0 || commissionPercentage > 100) {
+      return res.status(400).json({ success: false, message: 'Commission percentage must be a number between 0 and 100' });
+    }
+
+    const rep = await User.findOneAndUpdate(
+      { userId, role: { $in: repRoles } },
+      { commissionPercentage },
+      { new: true }
+    ).select('-password');
+
+    if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+    await logAudit(req.user.userId, 'commission_updated', 'user', userId, { commissionPercentage }, req);
+
+    res.json({
+      success: true,
+      message: 'Commission percentage updated successfully',
+      representative: { ...rep.toObject(), _id: rep.userId, commissionRate: commissionPercentage }
+    });
+  } catch (error) {
+    console.error('Update representative commission error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update commission percentage' });
+  }
+});
+
+/**
+ * @route   DELETE /api/admin/representatives/:userId
+ * @desc    Delete representative (soft delete preferred)
+ * @access  Super Admin
+ */
+router.delete('/representatives/:userId', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { permanent = 'false' } = req.query;
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+
+    // Check for active assignments
+    const activeStudents = await Student.countDocuments({
+      $or: [
+        { assignedAgent: userId },
+        { referredBy: userId },
+        { createdByRep: userId }
+      ]
+    });
+    const pendingCommissions = await Commission.countDocuments({
+      agentId: userId,
+      status: { $in: ['pending', 'approved'] }
+    });
+
+    if ((activeStudents > 0 || pendingCommissions > 0) && permanent === 'true') {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot permanently delete representative with ${activeStudents} linked student(s) and ${pendingCommissions} pending commission(s)`,
+        activeStudents,
+        pendingCommissions
+      });
+    }
+
+    if (permanent === 'true') {
+      const rep = await User.findOneAndDelete({ userId, role: { $in: repRoles } });
+      if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+      // Also remove profile
+      await Representative.findOneAndDelete({ userId });
+
+      await logAudit(req.user.userId, 'user_deleted', 'user', userId, { permanent: true }, req);
+      return res.json({ success: true, message: 'Representative permanently deleted' });
+    }
+
+    // Soft delete: deactivate user and mark profile as deleted
+    const rep = await User.findOneAndUpdate(
+      { userId, role: { $in: repRoles } },
+      { isActive: false },
+      { new: true }
+    ).select('-password');
+
+    if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+    await Representative.findOneAndUpdate(
+      { userId },
+      { isDeleted: true, deletedAt: new Date(), deletedBy: req.user.userId }
+    );
+
+    await logAudit(req.user.userId, 'user_deactivated', 'user', userId, { softDelete: true }, req);
+
+    res.json({
+      success: true,
+      message: 'Representative deactivated successfully',
+      representative: { ...rep.toObject(), _id: rep.userId },
+      activeStudents,
+      pendingCommissions
+    });
+  } catch (error) {
+    console.error('Delete representative error:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete representative' });
+  }
+});
+
+/**
+ * @route   POST /api/admin/representatives/:userId/reset-password
+ * @desc    Reset representative password
+ * @access  Super Admin
+ */
+router.post('/representatives/:userId/reset-password', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { newPassword } = req.body;
+    const repRoles = ['rep1', 'rep2', 'rep3'];
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+    }
+
+    const rep = await User.findOne({ userId, role: { $in: repRoles } });
+    if (!rep) return res.status(404).json({ success: false, message: 'Representative not found' });
+
+    rep.password = newPassword;
+    await rep.save();
+
+    await logAudit(req.user.userId, 'password_reset', 'user', userId, { resetBy: 'admin' }, req);
+    res.json({ success: true, message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset representative password error:', error);
+    res.status(500).json({ success: false, message: 'Failed to reset password' });
+  }
+});
+
+/**
+ * @route   GET /api/admin/representatives/:userId/commissions
+ * @desc    Get representative commission history with filters
+ * @access  Super Admin
+ */
+router.get('/representatives/:userId/commissions', authMiddleware, roleMiddleware('super_admin'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+
+    const query = { agentId: userId };
+    if (status !== 'all') query.status = status;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [commissions, total] = await Promise.all([
+      Commission.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      Commission.countDocuments(query)
+    ]);
+
+    // Enrich with student names
+    const enriched = await Promise.all(
+      commissions.map(async (c) => {
+        const student = await Student.findOne({ studentId: c.studentId }).lean();
+        const studentUser = student
+          ? await User.findOne({ userId: student.userId }).select('firstName lastName').lean()
+          : null;
+        return {
+          ...c,
+          studentName: studentUser ? `${studentUser.firstName} ${studentUser.lastName}` : 'N/A'
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      commissions: enriched,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get representative commissions error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch commissions' });
+  }
+});
+
+// =============================================================================
+// PAYMENT REQUESTS (admin moderation)
+// =============================================================================
+
+// List all payment requests (filterable)
+router.get(
+  '/payment-requests',
+  authMiddleware,
+  roleMiddleware('super_admin'),
+  async (req, res) => {
+    try {
+      const { status, partnerId, serviceRequestId, page = 1, limit = 50 } = req.query;
+      const q = {};
+      if (status) q.status = status;
+      if (partnerId) q.partnerId = partnerId;
+      if (serviceRequestId) q.serviceRequestId = serviceRequestId;
+
+      const skip = (Number(page) - 1) * Number(limit);
+      const [rawData, total] = await Promise.all([
+        PaymentRequest.find(q).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)).lean(),
+        PaymentRequest.countDocuments(q),
+      ]);
+
+      // Enrich with partner + service request info
+      const partnerIds = [...new Set(rawData.map((r) => r.partnerId))];
+      const serviceRequestIds = [...new Set(rawData.map((r) => r.serviceRequestId))];
+      const [partners, serviceRequests] = await Promise.all([
+        User.find({ userId: { $in: partnerIds } })
+          .select('userId firstName lastName email')
+          .lean(),
+        ServiceRequest.find({ serviceRequestId: { $in: serviceRequestIds } })
+          .select('serviceRequestId serviceType status studentId')
+          .lean(),
+      ]);
+      const partnerMap = Object.fromEntries(partners.map((p) => [p.userId, p]));
+      const srMap = Object.fromEntries(
+        serviceRequests.map((s) => [s.serviceRequestId, s])
+      );
+
+      const data = rawData.map((r) => ({
+        ...r,
+        partner: partnerMap[r.partnerId] || null,
+        serviceRequest: srMap[r.serviceRequestId] || null,
+      }));
+
+      const summary = {
+        pending: await PaymentRequest.countDocuments({ status: 'pending' }),
+        approved: await PaymentRequest.countDocuments({ status: 'approved' }),
+        paid: await PaymentRequest.countDocuments({ status: 'paid' }),
+      };
+
+      res.json({
+        data,
+        summary,
+        pagination: {
+          total,
+          page: Number(page),
+          limit: Number(limit),
+          totalPages: Math.max(1, Math.ceil(total / Number(limit))),
+        },
+      });
+    } catch (err) {
+      console.error('Admin list payment requests error:', err);
+      res.status(500).json({ error: 'Failed to fetch payment requests' });
+    }
+  }
+);
+
+// Approve
+router.patch(
+  '/payment-requests/:id/approve',
+  authMiddleware,
+  roleMiddleware('super_admin'),
+  async (req, res) => {
+    try {
+      const doc = await PaymentRequest.findOne({ paymentRequestId: req.params.id });
+      if (!doc) return res.status(404).json({ error: 'Payment request not found' });
+      if (doc.status !== 'pending') {
+        return res
+          .status(400)
+          .json({ error: `Cannot approve a ${doc.status} payment request` });
+      }
+      doc.status = 'approved';
+      doc.approvedAt = new Date();
+      doc.approvedBy = req.user.userId;
+      await doc.save();
+
+      try {
+        await createAuditLog({
+          actorUserId: req.user.userId,
+          actorRole: req.user.role,
+          action: 'payment_request_approved',
+          entityType: 'payment_request',
+          entityId: doc.paymentRequestId,
+          details: { amount: doc.amount },
+          req,
+        });
+      } catch (_) {}
+
+      res.json({ message: 'Payment request approved', data: doc });
+    } catch (err) {
+      console.error('Approve payment request error:', err);
+      res.status(500).json({ error: 'Failed to approve payment request' });
+    }
+  }
+);
+
+// Mark as paid
+router.patch(
+  '/payment-requests/:id/pay',
+  authMiddleware,
+  roleMiddleware('super_admin'),
+  async (req, res) => {
+    try {
+      const { paymentReference = '' } = req.body || {};
+      const doc = await PaymentRequest.findOne({ paymentRequestId: req.params.id });
+      if (!doc) return res.status(404).json({ error: 'Payment request not found' });
+      if (!['pending', 'approved'].includes(doc.status)) {
+        return res
+          .status(400)
+          .json({ error: `Cannot mark a ${doc.status} request as paid` });
+      }
+      if (doc.status === 'pending') {
+        doc.approvedAt = doc.approvedAt || new Date();
+        doc.approvedBy = doc.approvedBy || req.user.userId;
+      }
+      doc.status = 'paid';
+      doc.paidAt = new Date();
+      doc.paidBy = req.user.userId;
+      doc.paymentReference = paymentReference;
+      await doc.save();
+
+      try {
+        await createAuditLog({
+          actorUserId: req.user.userId,
+          actorRole: req.user.role,
+          action: 'payment_request_paid',
+          entityType: 'payment_request',
+          entityId: doc.paymentRequestId,
+          details: { amount: doc.amount, paymentReference },
+          req,
+        });
+      } catch (_) {}
+
+      res.json({ message: 'Payment request marked as paid', data: doc });
+    } catch (err) {
+      console.error('Mark paid payment request error:', err);
+      res.status(500).json({ error: 'Failed to mark payment request as paid' });
+    }
+  }
+);
+
+// Reject
+router.patch(
+  '/payment-requests/:id/reject',
+  authMiddleware,
+  roleMiddleware('super_admin'),
+  async (req, res) => {
+    try {
+      const { reason = '' } = req.body || {};
+      const doc = await PaymentRequest.findOne({ paymentRequestId: req.params.id });
+      if (!doc) return res.status(404).json({ error: 'Payment request not found' });
+      if (!['pending', 'approved'].includes(doc.status)) {
+        return res
+          .status(400)
+          .json({ error: `Cannot reject a ${doc.status} request` });
+      }
+      doc.status = 'rejected';
+      doc.rejectedAt = new Date();
+      doc.rejectionReason = reason;
+      await doc.save();
+      res.json({ message: 'Payment request rejected', data: doc });
+    } catch (err) {
+      console.error('Reject payment request error:', err);
+      res.status(500).json({ error: 'Failed to reject payment request' });
+    }
+  }
+);
 
 module.exports = router;

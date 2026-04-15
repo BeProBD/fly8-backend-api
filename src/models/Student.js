@@ -12,6 +12,10 @@ const studentSchema = new mongoose.Schema({
     ref: 'User'
   },
   interestedCountries: [String],
+  interestedServices: {
+    type: [String],
+    default: []
+  },
   selectedServices: [String],
   onboardingCompleted: {
     type: Boolean,
@@ -37,9 +41,30 @@ const studentSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Rep Level 3 (partner) who created this student profile
+  createdByRep: {
+    type: String,
+    ref: 'User',
+    default: null
+  },
+  // Interaction mode for this student
+  interactionMode: {
+    type: String,
+    enum: ['student-counselor', 'rep-counselor', null],
+    default: null
+  },
   country: {
     type: String,
     default: ''
+  },
+  referralSource: {
+    type: String,
+    enum: ['representative', 'social_media', 'office_member', 'friend', 'other', null],
+    default: null
+  },
+  representativeName: {
+    type: String,
+    default: null
   },
   intake: String,
   preferredDestination: String,
@@ -109,5 +134,15 @@ const studentSchema = new mongoose.Schema({
   oldProfileId: String, // Original additionalDetails ObjectId
   migratedAt: Date
 }, { timestamps: true });
+
+// Indexes for query performance
+// studentId and userId already have unique:true in schema definition
+// No need for duplicate index declarations
+studentSchema.index({ assignedCounselor: 1, status: 1 });
+studentSchema.index({ assignedAgent: 1, status: 1 });
+studentSchema.index({ referredBy: 1 });
+studentSchema.index({ createdByRep: 1 });
+studentSchema.index({ interactionMode: 1 });
+studentSchema.index({ status: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Student', studentSchema);

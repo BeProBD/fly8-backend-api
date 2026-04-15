@@ -10,28 +10,55 @@ const Task = require('../models/Task');
 const Commission = require('../models/Commission');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
-const { logAudit } = require('../utils/auditLogger');
+const { logAudit, logServiceRequestEvent } = require('../utils/auditLogger');
+const { validateStateTransition } = require('../utils/stateMachine');
 const { emitToUser, emitToRole } = require('../socket/socketManager');
 const StudentNote = require('../models/StudentNote');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/fileUpload');
 
 /**
- * @route   GET /api/agents/dashboard
- * @desc    Get agent dashboard data
- * @access  Agent
+ * Role-aware query helpers.
+ * When a counselor uses these routes, queries filter by assignedCounselor.
+ * When an agent uses them, queries filter by assignedAgent.
+ * This allows the entire agent infrastructure to be reused for counselors.
  */
-router.get('/dashboard', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+function getStudentFilter(user, extra = {}) {
+  const field = user.role === 'counselor' ? 'assignedCounselor' : 'assignedAgent';
+  return { [field]: user.userId, ...extra };
+}
+
+function getServiceRequestFilter(user, extra = {}) {
+  const field = user.role === 'counselor' ? 'assignedCounselor' : 'assignedAgent';
+  return { [field]: user.userId, ...extra };
+}
+
+/**
+ * Middleware: Injects req.assignmentField and req.assignmentFilter
+ * so route handlers can use role-aware queries without per-route changes.
+ */
+router.use(authMiddleware, (req, res, next) => {
+  if (req.user) {
+    req.assignmentField = req.user.role === 'counselor' ? 'assignedCounselor' : 'assignedAgent';
+  }
+  next();
+});
+
+/**
+ * @route   GET /api/agents/dashboard
+ * @desc    Get agent/counselor dashboard data
+ * @access  Agent, Counselor
+ */
+router.get('/dashboard', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
 
-    // Get assigned students count
-    const referredStudents = await Student.countDocuments({ assignedAgent: agentId });
+    // Get assigned students count (role-aware)
+    const referredStudents = await Student.countDocuments(getStudentFilter(req.user));
 
-    // Get active applications
-    const activeApplications = await ServiceRequest.countDocuments({
-      assignedAgent: agentId,
-      status: { $in: ['ASSIGNED', 'IN_PROGRESS'] }
-    });
+    // Get active applications (role-aware)
+    const activeApplications = await ServiceRequest.countDocuments(
+      getServiceRequestFilter(req.user, { status: { $in: ['ASSIGNED', 'IN_PROGRESS'] } })
+    );
 
     // Get commission stats
     const commissions = await Commission.find({ agentId });
@@ -42,8 +69,8 @@ router.get('/dashboard', authMiddleware, roleMiddleware('agent'), async (req, re
       .filter(c => c.status === 'pending' || c.status === 'approved')
       .reduce((sum, c) => sum + c.amount, 0);
 
-    // Get recent referrals
-    const recentStudents = await Student.find({ assignedAgent: agentId })
+    // Get recent referrals (role-aware)
+    const recentStudents = await Student.find(getStudentFilter(req.user))
       .sort({ createdAt: -1 })
       .limit(5)
       .lean();
@@ -79,16 +106,16 @@ router.get('/dashboard', authMiddleware, roleMiddleware('agent'), async (req, re
 });
 
 // Get assigned students (for agents)
-router.get('/my-students', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/my-students', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
-    const students = await Student.find({ assignedAgent: req.user.userId });
+    const students = await Student.find({ [req.assignmentField]: req.user.userId });
     
     const studentsWithDetails = [];
     for (const student of students) {
       const user = await User.findOne({ userId: student.userId }).select('-password');
       const applications = await ServiceApplication.find({ 
         studentId: student.studentId,
-        assignedAgent: req.user.userId 
+        [req.assignmentField]: req.user.userId 
       });
       
       studentsWithDetails.push({
@@ -117,7 +144,7 @@ const Settings = require('../models/Settings');
  * @desc    Get commission list with filters and summary
  * @access  Agent
  */
-router.get('/commissions', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/commissions', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { status, commissionType, studentId, startDate, endDate, page = 1, limit = 20 } = req.query;
@@ -173,7 +200,7 @@ router.get('/commissions', authMiddleware, roleMiddleware('agent'), async (req, 
  * @desc    Request payout for a single commission (legacy, kept for backward compatibility)
  * @access  Agent
  */
-router.post('/commissions/:commissionId/request-payout', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/commissions/:commissionId/request-payout', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { commissionId } = req.params;
     const commission = await Commission.findOne({ commissionId, agentId: req.user.userId });
@@ -206,7 +233,7 @@ router.post('/commissions/:commissionId/request-payout', authMiddleware, roleMid
  * @desc    Get agent wallet summary
  * @access  Agent
  */
-router.get('/wallet', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/wallet', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const wallet = await getAgentWallet(req.user.userId);
     res.json({ wallet });
@@ -221,7 +248,7 @@ router.get('/wallet', authMiddleware, roleMiddleware('agent'), async (req, res) 
  * @desc    Request a payout (withdrawal) from approved commissions
  * @access  Agent
  */
-router.post('/payouts/request', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/payouts/request', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { amount, note } = req.body;
@@ -305,7 +332,7 @@ router.post('/payouts/request', authMiddleware, roleMiddleware('agent'), async (
  * @desc    Get payout history
  * @access  Agent
  */
-router.get('/payouts', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/payouts', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { status, page = 1, limit = 20 } = req.query;
@@ -334,7 +361,7 @@ router.get('/payouts', authMiddleware, roleMiddleware('agent'), async (req, res)
  * @desc    Export commissions as CSV
  * @access  Agent
  */
-router.get('/commissions/export', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/commissions/export', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { startDate, endDate, status } = req.query;
@@ -393,9 +420,9 @@ router.get('/commissions/export', authMiddleware, roleMiddleware('agent'), async
  * @desc    Get all students with agent involvement
  * @access  Agent
  */
-router.get('/students', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/students', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
-    const students = await Student.find({ assignedAgent: req.user.userId })
+    const students = await Student.find({ [req.assignmentField]: req.user.userId })
       .sort({ createdAt: -1 })
       .lean();
 
@@ -433,11 +460,11 @@ router.get('/students', authMiddleware, roleMiddleware('agent'), async (req, res
  * @access  Agent
  * NOTE: This route MUST be defined BEFORE /students/:studentId to avoid Express catching "list" as a param
  */
-router.get('/students/list', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/students/list', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
 
-    const students = await Student.find({ assignedAgent: agentId })
+    const students = await Student.find({ [req.assignmentField]: agentId })
       .select('studentId userId')
       .lean();
 
@@ -472,13 +499,13 @@ router.get('/students/list', authMiddleware, roleMiddleware('agent'), async (req
  * @desc    Get full student details with aggregated metrics
  * @access  Agent
  */
-router.get('/students/:studentId', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/students/:studentId', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const agentId = req.user.userId;
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId }).lean();
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId }).lean();
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -539,13 +566,13 @@ router.get('/students/:studentId', authMiddleware, roleMiddleware('agent'), asyn
  * @desc    Update student profile (personal and academic info)
  * @access  Agent
  */
-router.put('/students/:studentId', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.put('/students/:studentId', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const agentId = req.user.userId;
 
     // Verify access
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -646,7 +673,7 @@ router.put('/students/:studentId', authMiddleware, roleMiddleware('agent'), asyn
  * @desc    Apply a service for a student (creates ServiceRequest)
  * @access  Agent
  */
-router.post('/students/:studentId/apply-service', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/students/:studentId/apply-service', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const { serviceType } = req.body;
@@ -673,7 +700,7 @@ router.post('/students/:studentId/apply-service', authMiddleware, roleMiddleware
     }
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -699,7 +726,7 @@ router.post('/students/:studentId/apply-service', authMiddleware, roleMiddleware
       studentId,
       serviceType,
       status: 'PENDING_ADMIN_ASSIGNMENT',
-      assignedAgent: agentId,
+      [req.assignmentField]: agentId,
       appliedAt: new Date(),
       progress: 0, // Start at 0 until approved
       priority: 'MEDIUM',
@@ -813,13 +840,13 @@ router.post('/students/:studentId/apply-service', authMiddleware, roleMiddleware
  * @desc    Get all notes for a student
  * @access  Agent
  */
-router.get('/students/:studentId/notes', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/students/:studentId/notes', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const agentId = req.user.userId;
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -859,7 +886,7 @@ router.get('/students/:studentId/notes', authMiddleware, roleMiddleware('agent')
  * @desc    Add a note for a student
  * @access  Agent
  */
-router.post('/students/:studentId/notes', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/students/:studentId/notes', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const { text } = req.body;
@@ -870,7 +897,7 @@ router.post('/students/:studentId/notes', authMiddleware, roleMiddleware('agent'
     }
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -935,7 +962,7 @@ router.post('/students/:studentId/notes', authMiddleware, roleMiddleware('agent'
  * @desc    Upload a document for a student
  * @access  Agent
  */
-router.post('/students/:studentId/documents', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/students/:studentId/documents', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const { documentType } = req.body;
@@ -947,7 +974,7 @@ router.post('/students/:studentId/documents', authMiddleware, roleMiddleware('ag
     }
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -998,7 +1025,7 @@ router.post('/students/:studentId/documents', authMiddleware, roleMiddleware('ag
  * @desc    Delete a document for a student
  * @access  Agent
  */
-router.delete('/students/:studentId/documents/:documentType', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.delete('/students/:studentId/documents/:documentType', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId, documentType } = req.params;
     const agentId = req.user.userId;
@@ -1009,7 +1036,7 @@ router.delete('/students/:studentId/documents/:documentType', authMiddleware, ro
     }
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -1044,7 +1071,7 @@ router.delete('/students/:studentId/documents/:documentType', authMiddleware, ro
  * @desc    Refer a new student
  * @access  Agent
  */
-router.post('/refer-student', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/refer-student', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { firstName, lastName, email, phone, country, destinationCountry, interestedServices, notes } = req.body;
 
@@ -1084,7 +1111,7 @@ router.post('/refer-student', authMiddleware, roleMiddleware('agent'), async (re
       country: country || '',
       interestedCountries: destinationCountry ? [destinationCountry] : [],
       selectedServices: interestedServices || [],
-      assignedAgent: req.user.userId,
+      [req.assignmentField]: req.user.userId,
       referredBy: req.user.userId,
       referralNotes: notes || '',
       onboardingCompleted: false,
@@ -1130,7 +1157,7 @@ router.post('/refer-student', authMiddleware, roleMiddleware('agent'), async (re
  * @desc    Get commission statistics with breakdowns
  * @access  Agent
  */
-router.get('/commission-stats', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/commission-stats', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const commissions = await Commission.find({ agentId, isDeleted: false }).lean();
@@ -1198,7 +1225,7 @@ router.get('/commission-stats', authMiddleware, roleMiddleware('agent'), async (
  * @desc    Get commission history with filters and breakdown
  * @access  Agent
  */
-router.get('/commission-history', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/commission-history', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { page = 1, limit = 20, status, commissionType, startDate, endDate } = req.query;
@@ -1299,7 +1326,7 @@ router.get('/commission-history', authMiddleware, roleMiddleware('agent'), async
  * @desc    Get comprehensive earnings summary with monthly breakdown
  * @access  Agent
  */
-router.get('/earnings', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/earnings', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const commissions = await Commission.find({ agentId, isDeleted: false }).lean();
@@ -1395,12 +1422,12 @@ router.get('/earnings', authMiddleware, roleMiddleware('agent'), async (req, res
  * @desc    Get service requests assigned to agent
  * @access  Agent
  */
-router.get('/service-requests', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/service-requests', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { status, page = 1, limit = 20 } = req.query;
 
-    const query = { assignedAgent: agentId };
+    const query = { [req.assignmentField]: agentId };
     if (status && status !== 'all') {
       query.status = status;
     }
@@ -1454,14 +1481,14 @@ router.get('/service-requests', authMiddleware, roleMiddleware('agent'), async (
  * @desc    Update service request progress (agent)
  * @access  Agent
  */
-router.patch('/service-requests/:requestId/progress', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/service-requests/:requestId/progress', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { requestId } = req.params;
     const { status, note } = req.body;
 
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: requestId,
-      assignedAgent: req.user.userId
+      [req.assignmentField]: req.user.userId
     });
 
     if (!serviceRequest) {
@@ -1510,7 +1537,7 @@ router.patch('/service-requests/:requestId/progress', authMiddleware, roleMiddle
  * @desc    Add note to service request (agent)
  * @access  Agent
  */
-router.post('/service-requests/:requestId/notes', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/service-requests/:requestId/notes', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { requestId } = req.params;
     const { text, isInternal = false } = req.body;
@@ -1521,7 +1548,7 @@ router.post('/service-requests/:requestId/notes', authMiddleware, roleMiddleware
 
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: requestId,
-      assignedAgent: req.user.userId
+      [req.assignmentField]: req.user.userId
     });
 
     if (!serviceRequest) {
@@ -1554,12 +1581,12 @@ router.post('/service-requests/:requestId/notes', authMiddleware, roleMiddleware
  * @desc    Get service requests grouped by status (Pipeline View)
  * @access  Agent
  */
-router.get('/cases/pipeline', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/cases/pipeline', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
 
     // Get all service requests for this agent
-    const serviceRequests = await ServiceRequest.find({ assignedAgent: agentId })
+    const serviceRequests = await ServiceRequest.find({ [req.assignmentField]: agentId })
       .sort({ priority: -1, deadline: 1, createdAt: -1 })
       .lean();
 
@@ -1577,6 +1604,18 @@ router.get('/cases/pipeline', authMiddleware, roleMiddleware('agent'), async (re
           status: 'COMPLETED'
         });
 
+        // Surface partner info for rep-counselor cases
+        const partnerUserId = request.representativeId || student?.createdByRep;
+        const partner = partnerUserId
+          ? await User.findOne({ userId: partnerUserId })
+              .select('userId firstName lastName email avatar')
+              .lean()
+          : null;
+        const isPartnerManaged =
+          request.interactionMode === 'rep-counselor' ||
+          student?.interactionMode === 'rep-counselor' ||
+          !!partnerUserId;
+
         return {
           ...request,
           student: studentUser ? {
@@ -1587,6 +1626,8 @@ router.get('/cases/pipeline', authMiddleware, roleMiddleware('agent'), async (re
             avatar: studentUser.avatar,
             phone: studentUser.phone
           } : null,
+          partner,
+          isPartnerManaged,
           taskStats: {
             total: taskCount,
             completed: completedTaskCount,
@@ -1633,7 +1674,7 @@ router.get('/cases/pipeline', authMiddleware, roleMiddleware('agent'), async (re
  * @desc    Get full case details (Case File)
  * @access  Agent
  */
-router.get('/cases/:id', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/cases/:id', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const agentId = req.user.userId;
@@ -1641,7 +1682,7 @@ router.get('/cases/:id', authMiddleware, roleMiddleware('agent'), async (req, re
     // Build query - only use serviceRequestId to avoid ObjectId cast errors
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     }).lean();
 
     if (!serviceRequest) {
@@ -1687,6 +1728,19 @@ router.get('/cases/:id', authMiddleware, roleMiddleware('agent'), async (req, re
         .lean();
     }
 
+    // Partner (rep3) info for partner-managed cases
+    let partner = null;
+    const partnerUserId = serviceRequest.representativeId || studentData?.createdByRep;
+    if (partnerUserId) {
+      partner = await User.findOne({ userId: partnerUserId })
+        .select('userId firstName lastName email avatar phone')
+        .lean();
+    }
+    const isPartnerManaged =
+      serviceRequest.interactionMode === 'rep-counselor' ||
+      studentData?.interactionMode === 'rep-counselor' ||
+      !!partnerUserId;
+
     // Calculate task statistics
     const taskStats = {
       total: tasks.length,
@@ -1706,6 +1760,8 @@ router.get('/cases/:id', authMiddleware, roleMiddleware('agent'), async (req, re
       priority: serviceRequest.priority || 'MEDIUM',
       student: studentData,
       counselor,
+      partner,
+      isPartnerManaged,
       tasks,
       taskStats,
       // Flag for frontend to show read-only view when pending approval
@@ -1724,7 +1780,7 @@ router.get('/cases/:id', authMiddleware, roleMiddleware('agent'), async (req, re
  * @desc    Update case status with history logging
  * @access  Agent
  */
-router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const { status, note } = req.body;
@@ -1732,14 +1788,9 @@ router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async
 
     console.log('[STATUS UPDATE] Starting - caseId:', id, 'status:', status, 'agentId:', agentId);
 
-    const validStatuses = ['ASSIGNED', 'IN_PROGRESS', 'WAITING_STUDENT', 'ON_HOLD', 'COMPLETED'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: 'Invalid status. Valid values: ' + validStatuses.join(', ') });
-    }
-
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -1753,6 +1804,17 @@ router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async
         error: 'Access denied',
         message: 'You cannot modify this service request until it is approved by Super Admin.',
         approvalStatus: serviceRequest.agentApprovalStatus
+      });
+    }
+
+    // STRICT STATE MACHINE VALIDATION
+    const transition = validateStateTransition(req.user.role, serviceRequest.status, status);
+    if (!transition.valid) {
+      return res.status(400).json({
+        error: transition.error,
+        currentStatus: serviceRequest.status,
+        requestedStatus: status,
+        allowedTransitions: transition.allowedTransitions
       });
     }
 
@@ -1777,28 +1839,36 @@ router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async
     }
 
     try {
-      await logAudit(
-        agentId,
-        'case_status_updated',
-        'service_request',
-        serviceRequest.serviceRequestId,
-        { oldStatus, newStatus: status, note },
-        req
-      );
+      const auditAction = status === 'COMPLETED' ? 'service_request_completed' :
+                          status === 'CANCELLED' ? 'service_request_cancelled' :
+                          'service_request_status_changed';
+      await logServiceRequestEvent(req, auditAction, serviceRequest, oldStatus);
       console.log('[STATUS UPDATE] Audit logged');
     } catch (auditError) {
       console.error('[STATUS UPDATE] Audit logging failed (non-fatal):', auditError.message);
       // Don't throw - audit failure shouldn't block the operation
     }
 
-    // Auto-create VAS commission when service request reaches COMPLETED
-    if (status === 'COMPLETED' && serviceRequest.assignedAgent) {
-      try {
-        const commissionService = require('../services/commissionService');
-        await commissionService.createVASCommission(serviceRequest, agentId);
-        console.log('[STATUS UPDATE] VAS commission created');
-      } catch (commError) {
-        console.error('[STATUS UPDATE] Commission creation failed (non-fatal):', commError.message);
+    // Auto-create commissions when service request reaches COMPLETED
+    if (status === 'COMPLETED') {
+      const commissionService = require('../services/commissionService');
+      // Agent/Counselor commission
+      if (serviceRequest.assignedAgent) {
+        try {
+          await commissionService.createVASCommission(serviceRequest, agentId);
+          console.log('[STATUS UPDATE] VAS commission created');
+        } catch (commError) {
+          console.error('[STATUS UPDATE] Commission creation failed (non-fatal):', commError.message);
+        }
+      }
+      // Representative commission (if a rep is linked to this service request)
+      if (serviceRequest.representativeId) {
+        try {
+          await commissionService.createRepresentativeCommission(serviceRequest, agentId);
+          console.log('[STATUS UPDATE] Representative commission created');
+        } catch (commError) {
+          console.error('[STATUS UPDATE] Rep commission creation failed (non-fatal):', commError.message);
+        }
       }
     }
 
@@ -1839,7 +1909,7 @@ router.patch('/cases/:id/status', authMiddleware, roleMiddleware('agent'), async
  * @desc    Update case progress percentage
  * @access  Agent
  */
-router.patch('/cases/:id/progress', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/cases/:id/progress', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const { progress, note } = req.body;
@@ -1851,7 +1921,7 @@ router.patch('/cases/:id/progress', authMiddleware, roleMiddleware('agent'), asy
 
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -1891,7 +1961,7 @@ router.patch('/cases/:id/progress', authMiddleware, roleMiddleware('agent'), asy
  * @desc    Update case deadline
  * @access  Agent
  */
-router.patch('/cases/:id/deadline', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/cases/:id/deadline', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const { deadline, note } = req.body;
@@ -1899,7 +1969,7 @@ router.patch('/cases/:id/deadline', authMiddleware, roleMiddleware('agent'), asy
 
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -1944,7 +2014,7 @@ router.patch('/cases/:id/deadline', authMiddleware, roleMiddleware('agent'), asy
  * @desc    Update case priority
  * @access  Agent
  */
-router.patch('/cases/:id/priority', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/cases/:id/priority', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const { priority, note } = req.body;
@@ -1957,7 +2027,7 @@ router.patch('/cases/:id/priority', authMiddleware, roleMiddleware('agent'), asy
 
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -2006,13 +2076,13 @@ router.patch('/cases/:id/priority', authMiddleware, roleMiddleware('agent'), asy
  * @desc    Get all tasks from all cases assigned to agent (Work Queue)
  * @access  Agent
  */
-router.get('/workqueue', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/workqueue', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
     const { filter, studentId, serviceType, page = 1, limit = 50 } = req.query;
 
     // First get all service requests assigned to this agent
-    const agentServiceRequests = await ServiceRequest.find({ assignedAgent: agentId })
+    const agentServiceRequests = await ServiceRequest.find({ [req.assignmentField]: agentId })
       .select('serviceRequestId studentId serviceType status')
       .lean();
 
@@ -2129,7 +2199,7 @@ router.get('/workqueue', authMiddleware, roleMiddleware('agent'), async (req, re
  * @desc    Create a new task for a specific case
  * @access  Agent
  */
-router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { id } = req.params;
     const { taskType, title, description, instructions, dueDate, priority } = req.body;
@@ -2143,7 +2213,7 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
     // Find the service request
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: id,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -2165,6 +2235,15 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
       return res.status(404).json({ error: 'Student not found for this case' });
     }
 
+    // Partner-managed (rep-counselor) cases route tasks to the partner,
+    // not the student placeholder user.
+    const isRepCounselor =
+      serviceRequest.interactionMode === 'rep-counselor' ||
+      student.interactionMode === 'rep-counselor';
+    const partnerUserId = serviceRequest.representativeId || student.createdByRep;
+    const taskAssignee = isRepCounselor && partnerUserId ? partnerUserId : student.userId;
+    const taskAssigneeRole = isRepCounselor && partnerUserId ? 'rep3' : 'student';
+
     // Create the task
     const task = new Task({
       taskId: uuidv4(),
@@ -2173,7 +2252,8 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
       title,
       description,
       instructions: instructions || '',
-      assignedTo: student.userId,
+      assignedTo: taskAssignee,
+      assignedToRole: taskAssigneeRole,
       assignedBy: agentId,
       status: 'PENDING',
       priority: priority || 'MEDIUM',
@@ -2198,10 +2278,10 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
       req
     );
 
-    // Notify student
+    // Notify the actual assignee (partner for rep-counselor, else student)
     const notification = new Notification({
       notificationId: uuidv4(),
-      recipientId: student.userId,
+      recipientId: taskAssignee,
       type: 'TASK_ASSIGNED',
       title: 'New Task Assigned',
       message: `You have a new task: ${title}`,
@@ -2210,7 +2290,8 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
       metadata: { taskId: task.taskId, serviceRequestId: serviceRequest.serviceRequestId }
     });
     await notification.save();
-    emitToUser(student.userId, 'new_notification', notification);
+    emitToUser(taskAssignee, 'new_notification', notification);
+    emitToUser(taskAssignee, 'task_created', task);
 
     res.status(201).json({ message: 'Task created successfully', task });
   } catch (error) {
@@ -2224,7 +2305,7 @@ router.post('/cases/:id/tasks', authMiddleware, roleMiddleware('agent'), async (
  * @desc    Mark a task as completed
  * @access  Agent
  */
-router.patch('/tasks/:taskId/complete', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.patch('/tasks/:taskId/complete', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { taskId } = req.params;
     const { note } = req.body;
@@ -2239,7 +2320,7 @@ router.patch('/tasks/:taskId/complete', authMiddleware, roleMiddleware('agent'),
     // Verify agent is assigned to this case
     const serviceRequest = await ServiceRequest.findOne({
       serviceRequestId: task.serviceRequestId,
-      assignedAgent: agentId
+      [req.assignmentField]: agentId
     });
 
     if (!serviceRequest) {
@@ -2284,14 +2365,14 @@ router.patch('/tasks/:taskId/complete', authMiddleware, roleMiddleware('agent'),
  * @desc    Get service request statuses for all agent's students (for explore page buttons)
  * @access  Agent
  */
-router.get('/explore/service-status', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.get('/explore/service-status', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const agentId = req.user.userId;
 
     // Get all service requests initiated by this agent or assigned to this agent
     const serviceRequests = await ServiceRequest.find({
       $or: [
-        { assignedAgent: agentId },
+        { [req.assignmentField]: agentId },
         { isAgentInitiated: true, 'metadata.agentId': agentId }
       ],
       status: { $ne: 'CANCELLED' }
@@ -2325,7 +2406,7 @@ router.get('/explore/service-status', authMiddleware, roleMiddleware('agent'), a
  * @desc    Submit a service request for a student from the explore page (with notes and documents)
  * @access  Agent
  */
-router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent'), async (req, res) => {
+router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent', 'counselor'), async (req, res) => {
   try {
     const { studentId, serviceType, notes } = req.body;
     const agentId = req.user.userId;
@@ -2351,7 +2432,7 @@ router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent'), a
     }
 
     // Verify agent has access to this student
-    const student = await Student.findOne({ studentId, assignedAgent: agentId });
+    const student = await Student.findOne({ studentId, [req.assignmentField]: agentId });
     if (!student) {
       return res.status(404).json({ error: 'Student not found or not assigned to you' });
     }
@@ -2405,7 +2486,7 @@ router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent'), a
       studentId,
       serviceType,
       status: 'PENDING_ADMIN_ASSIGNMENT',
-      assignedAgent: agentId,
+      [req.assignmentField]: agentId,
       appliedAt: new Date(),
       progress: 0,
       priority: 'MEDIUM',
@@ -2514,11 +2595,11 @@ router.post('/explore/refer-service', authMiddleware, roleMiddleware('agent'), a
 
 const agentCourseController = require('../controllers/agentCourseController');
 
-router.get('/courses/search', authMiddleware, roleMiddleware('agent'), agentCourseController.searchPrograms);
-router.get('/courses/filters', authMiddleware, roleMiddleware('agent'), agentCourseController.getFilterOptions);
-router.get('/courses/shortlists', authMiddleware, roleMiddleware('agent'), agentCourseController.getShortlists);
-router.post('/courses/shortlist', authMiddleware, roleMiddleware('agent'), agentCourseController.addToShortlist);
-router.delete('/courses/shortlist/:shortlistId', authMiddleware, roleMiddleware('agent'), agentCourseController.removeFromShortlist);
-router.get('/courses/:id', authMiddleware, roleMiddleware('agent'), agentCourseController.getProgramDetail);
+router.get('/courses/search', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.searchPrograms);
+router.get('/courses/filters', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.getFilterOptions);
+router.get('/courses/shortlists', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.getShortlists);
+router.post('/courses/shortlist', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.addToShortlist);
+router.delete('/courses/shortlist/:shortlistId', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.removeFromShortlist);
+router.get('/courses/:id', authMiddleware, roleMiddleware('agent', 'counselor'), agentCourseController.getProgramDetail);
 
 module.exports = router;

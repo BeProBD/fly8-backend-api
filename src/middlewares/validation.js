@@ -94,6 +94,7 @@ const serviceRequestSchemas = {
       'any.only': 'Invalid service type',
       'any.required': 'Service type is required'
     }),
+    representativeName: Joi.string().max(200).allow('').optional(),
     notes: Joi.string().max(2000).allow('').optional()
   }),
 

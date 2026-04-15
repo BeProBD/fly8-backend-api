@@ -50,7 +50,7 @@ const taskSchema = new mongoose.Schema({
   assignedTo: {
     type: String,
     required: true,
-    ref: 'User', // Student userId
+    ref: 'User', // Student or Rep3 userId
     index: true
   },
   assignedBy: {
@@ -58,6 +58,12 @@ const taskSchema = new mongoose.Schema({
     required: true,
     ref: 'User', // Counselor/Agent userId
     index: true
+  },
+  // When task is assigned to a rep3 instead of student directly
+  assignedToRole: {
+    type: String,
+    enum: ['student', 'rep3', null],
+    default: 'student'
   },
 
   // Status tracking

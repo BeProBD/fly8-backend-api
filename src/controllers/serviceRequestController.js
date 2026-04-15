@@ -12,17 +12,28 @@ const notificationService = require('../services/notificationService');
 const { logServiceRequestEvent, logAssignmentEvent } = require('../utils/auditLogger');
 const { emitToStudent, broadcastServiceRequestUpdate } = require('../socket/socketManager');
 const { validateFormData } = require('../utils/formDataValidator');
+const { validateStateTransition } = require('../utils/stateMachine');
+const { eventBus, EVENTS } = require('../events/eventBus');
 
 /**
  * Create a new service request (Student only)
+ * Layer 2: Students in rep-counselor mode cannot create service requests
  */
 const createServiceRequest = async (req, res) => {
   try {
-    const { serviceType, metadata, formData } = req.body;
+    const { serviceType, metadata, formData, representativeName } = req.body;
 
     // Verify student exists
     if (!req.student) {
       return res.status(400).json({ error: 'Student record not found' });
+    }
+
+    // Layer 2: Block students in rep-counselor mode
+    if (req.user.role === 'student' && req.student.interactionMode === 'rep-counselor') {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'Your account is managed by a representative. They will create service requests on your behalf.'
+      });
     }
 
     // Validate formData if provided
@@ -66,6 +77,11 @@ const createServiceRequest = async (req, res) => {
       formSubmittedAt: formData ? new Date() : null,
       appliedAt: new Date()
     });
+
+    // Optional: representative name for direct student applications
+    if (typeof representativeName === 'string' && representativeName.trim()) {
+      serviceRequest.representativeName = representativeName.trim();
+    }
 
     // Add initial status to history
     serviceRequest.statusHistory.push({
@@ -116,6 +132,8 @@ const createServiceRequest = async (req, res) => {
 
 /**
  * Get all service requests (role-based filtering)
+ * Layer 2: Students in rep-counselor mode are blocked
+ * Layer 3: Query excludes rep-counselor records for students
  */
 const getServiceRequests = async (req, res) => {
   try {
@@ -135,7 +153,24 @@ const getServiceRequests = async (req, res) => {
         if (!req.student) {
           return res.status(400).json({ error: 'Student record not found' });
         }
-        filter = { studentId: req.student.studentId };
+
+        // Layer 2: Block students in rep-counselor mode entirely
+        if (req.student.interactionMode === 'rep-counselor') {
+          return res.status(403).json({
+            error: 'Access denied',
+            message: 'Your account is managed by a representative. Please contact them for service updates.'
+          });
+        }
+
+        // Layer 3: Query-level — only return student-counselor mode requests
+        filter = {
+          studentId: req.student.studentId,
+          $or: [
+            { interactionMode: 'student-counselor' },
+            { interactionMode: null },
+            { interactionMode: { $exists: false } }
+          ]
+        };
         break;
 
       case 'counselor':
@@ -231,15 +266,31 @@ const getServiceRequests = async (req, res) => {
 
 /**
  * Get single service request by ID
+ * Layer 2: Students in rep-counselor mode cannot access any SR
+ * Layer 3: Query ensures students cannot retrieve rep-counselor SRs
  */
 const getServiceRequestById = async (req, res) => {
   try {
     const { serviceRequestId } = req.params;
 
-    const serviceRequest = await ServiceRequest.findOne({ serviceRequestId });
+    // Layer 3: For students, query-level filter excludes rep-counselor SRs
+    let findFilter = { serviceRequestId };
+    if (req.user.role === 'student') {
+      findFilter.interactionMode = { $ne: 'rep-counselor' };
+    }
+
+    const serviceRequest = await ServiceRequest.findOne(findFilter);
 
     if (!serviceRequest) {
       return res.status(404).json({ error: 'Service request not found' });
+    }
+
+    // Layer 2: Explicit interactionMode block for students
+    if (req.user.role === 'student' && serviceRequest.interactionMode === 'rep-counselor') {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'This service request is managed by your representative. Please contact them for updates.'
+      });
     }
 
     // Check access permissions
@@ -401,6 +452,7 @@ const assignServiceRequest = async (req, res) => {
 
 /**
  * Update service request status
+ * Uses centralized state machine for transition + role validation.
  */
 const updateServiceRequestStatus = async (req, res) => {
   try {
@@ -413,26 +465,18 @@ const updateServiceRequestStatus = async (req, res) => {
       return res.status(404).json({ error: 'Service request not found' });
     }
 
-    // Validate status transition
-    const validTransitions = {
-      'PENDING_ADMIN_ASSIGNMENT': ['ASSIGNED', 'CANCELLED'],
-      'ASSIGNED': ['IN_PROGRESS', 'ON_HOLD', 'CANCELLED'],
-      'IN_PROGRESS': ['COMPLETED', 'ON_HOLD', 'CANCELLED'],
-      'ON_HOLD': ['IN_PROGRESS', 'CANCELLED'],
-      'COMPLETED': [], // Terminal state
-      'CANCELLED': [] // Terminal state
-    };
-
-    if (!validTransitions[serviceRequest.status].includes(status)) {
+    // Centralized state machine: validates transition + role permissions
+    const transition = validateStateTransition(req.user.role, serviceRequest.status, status);
+    if (!transition.valid) {
       return res.status(400).json({
-        error: 'Invalid status transition',
+        error: transition.error,
         currentStatus: serviceRequest.status,
         requestedStatus: status,
-        allowedTransitions: validTransitions[serviceRequest.status]
+        allowedTransitions: transition.allowedTransitions || []
       });
     }
 
-    // Check permissions for status updates
+    // Ownership check (non-admins must be assigned)
     const canUpdate =
       req.user.role === 'super_admin' ||
       ((req.user.role === 'counselor' || req.user.role === 'agent') &&
@@ -456,6 +500,16 @@ const updateServiceRequestStatus = async (req, res) => {
                         'service_request_status_changed';
     await logServiceRequestEvent(req, auditAction, serviceRequest, previousStatus);
 
+    // Emit domain events for side-effects (commission, audit, etc.)
+    eventBus.emit(EVENTS.SERVICE_REQUEST_STATUS_CHANGED, {
+      serviceRequest, previousStatus, triggeredBy: req.user.userId, req
+    });
+    if (status === 'COMPLETED') {
+      eventBus.emit(EVENTS.SERVICE_REQUEST_COMPLETED, {
+        serviceRequest, triggeredBy: req.user.userId, req
+      });
+    }
+
     // Send notification if service is completed
     if (status === 'COMPLETED') {
       try {
@@ -471,7 +525,6 @@ const updateServiceRequestStatus = async (req, res) => {
         }
       } catch (notifError) {
         console.error('Notification error:', notifError);
-        // Don't fail the request if notification fails
       }
     }
 
@@ -501,6 +554,8 @@ const updateServiceRequestStatus = async (req, res) => {
 
 /**
  * Add note to service request
+ * Layer 2: Students in rep-counselor mode cannot add notes
+ * Layer 3: Query excludes rep-counselor SRs for students
  */
 const addServiceRequestNote = async (req, res) => {
   try {
@@ -511,10 +566,24 @@ const addServiceRequestNote = async (req, res) => {
       return res.status(400).json({ error: 'Note text is required' });
     }
 
-    const serviceRequest = await ServiceRequest.findOne({ serviceRequestId });
+    // Layer 3: For students, query-level filter excludes rep-counselor SRs
+    let findFilter = { serviceRequestId };
+    if (req.user.role === 'student') {
+      findFilter.interactionMode = { $ne: 'rep-counselor' };
+    }
+
+    const serviceRequest = await ServiceRequest.findOne(findFilter);
 
     if (!serviceRequest) {
       return res.status(404).json({ error: 'Service request not found' });
+    }
+
+    // Layer 2: Explicit interactionMode block for students
+    if (req.user.role === 'student' && serviceRequest.interactionMode === 'rep-counselor') {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'This service request is managed by your representative. You cannot add notes.'
+      });
     }
 
     // Check permissions

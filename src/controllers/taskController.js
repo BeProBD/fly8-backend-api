@@ -57,6 +57,15 @@ const createTask = async (req, res) => {
       return res.status(404).json({ error: 'Student not found' });
     }
 
+    // For partner-managed (rep-counselor) cases, tasks go to the partner who owns the case.
+    // Prefer the serviceRequest's representativeId (source of truth for this request),
+    // fall back to the student's createdByRep.
+    const isRepCounselor =
+      serviceRequest.interactionMode === 'rep-counselor' ||
+      student.interactionMode === 'rep-counselor';
+    const partnerUserId = serviceRequest.representativeId || student.createdByRep;
+    const taskAssignee = isRepCounselor && partnerUserId ? partnerUserId : student.userId;
+
     // Create task
     const taskId = uuidv4();
     const task = new Task({
@@ -66,7 +75,7 @@ const createTask = async (req, res) => {
       title,
       description,
       instructions: instructions || '',
-      assignedTo: student.userId,
+      assignedTo: taskAssignee,
       assignedBy: req.user.userId,
       status: 'PENDING',
       priority: priority || 'MEDIUM',
@@ -92,21 +101,21 @@ const createTask = async (req, res) => {
       await serviceRequest.save();
     }
 
-    // Send notification to student
+    // Send notification to assignee (partner for rep-counselor, else student)
     try {
-      const studentUser = await User.findOne({ userId: student.userId });
-      if (studentUser) {
-        await notificationService.notifyTaskAssigned(task, studentUser, req.user);
+      const assigneeUser = await User.findOne({ userId: taskAssignee });
+      if (assigneeUser) {
+        await notificationService.notifyTaskAssigned(task, assigneeUser, req.user);
       }
     } catch (notifError) {
       console.error('Notification error:', notifError);
       // Don't fail the request if notification fails
     }
 
-    // Emit real-time update to student
+    // Emit real-time update to assignee
     try {
       const enrichedTask = await getEnrichedTask(task);
-      emitToUser(student.userId, 'task_created', enrichedTask);
+      emitToUser(taskAssignee, 'task_created', enrichedTask);
       broadcastTaskUpdate(enrichedTask, 'task_created');
     } catch (socketError) {
       console.error('Socket emission error:', socketError);
@@ -277,8 +286,10 @@ const submitTask = async (req, res) => {
     const { taskId } = req.params;
     const { text, files } = req.body;
 
-    if (!text) {
-      return res.status(400).json({ error: 'Submission text is required' });
+    const hasText = typeof text === 'string' && text.trim().length > 0;
+    const hasFiles = Array.isArray(files) && files.length > 0;
+    if (!hasText && !hasFiles) {
+      return res.status(400).json({ error: 'Submission must include text or at least one file' });
     }
 
     const task = await Task.findOne({ taskId });

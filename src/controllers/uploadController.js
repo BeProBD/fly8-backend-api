@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const Task = require('../models/Task');
 const ServiceRequest = require('../models/ServiceRequest');
 const { uploadToCloudinary, uploadMultipleToCloudinary, deleteFromCloudinary, validateFile } = require('../utils/fileUpload');
+const { cloudinary } = require('../config/cloudinary');
 const { logFileUploadEvent } = require('../utils/auditLogger');
 
 /**
@@ -361,11 +362,50 @@ const getSignedUploadParams = async (req, res) => {
   }
 };
 
+/**
+ * Proxy/redirect a Cloudinary URL as a signed attachment.
+ * Needed because legacy uploads went to `/image/upload/*.pdf`, which Cloudinary
+ * accounts block by default (HTTP 401). Generating a signed download URL
+ * bypasses that restriction and forces an attachment download.
+ */
+const downloadCloudinaryFile = async (req, res) => {
+  try {
+    const { url, name } = req.query;
+    if (!url) return res.status(400).json({ error: 'url query param required' });
+
+    const match = String(url).match(
+      /res\.cloudinary\.com\/[^/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+?)(?:\.([a-zA-Z0-9]+))?$/
+    );
+
+    if (!match) {
+      return res.redirect(url);
+    }
+
+    const resourceType = match[1];
+    const publicId = decodeURIComponent(match[2]);
+    const format = match[3] || undefined;
+
+    const signedUrl = cloudinary.utils.private_download_url(publicId, format, {
+      resource_type: resourceType,
+      type: 'upload',
+      attachment: name || true,
+      expires_at: Math.floor(Date.now() / 1000) + 60 * 10
+    });
+
+    return res.redirect(signedUrl);
+  } catch (error) {
+    console.error('Download proxy error:', error);
+    if (req.query.url) return res.redirect(req.query.url);
+    return res.status(500).json({ error: 'Failed to generate download URL' });
+  }
+};
+
 module.exports = {
   uploadFile,
   uploadMultipleFiles,
   uploadTaskFiles,
   uploadServiceRequestDocument,
   deleteFile,
-  getSignedUploadParams
+  getSignedUploadParams,
+  downloadCloudinaryFile
 };

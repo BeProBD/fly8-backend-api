@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const { authMiddleware, roleMiddleware } = require('../middlewares/auth');
+const { enforceStudentInteractionMode } = require('../middlewares/interactionMode');
 const Student = require('../models/Student');
 const ServiceApplication = require('../models/ServiceApplication');
 const ServiceRequest = require('../models/ServiceRequest');
@@ -39,7 +40,28 @@ const SERVICE_ID_TO_TYPE = {
 // Complete student onboarding
 router.post('/onboarding', authMiddleware, roleMiddleware('student'), async (req, res) => {
   try {
-    const { interestedCountries, selectedServices, phone, country } = req.body;
+    const {
+      interestedCountries,
+      interestedServices,
+      selectedServices,
+      phone,
+      country,
+      referralSource,
+      representativeName
+    } = req.body;
+
+    if (referralSource === 'representative' && !representativeName?.trim()) {
+      return res.status(400).json({ error: 'Representative name is required' });
+    }
+
+    const normalizedReferralSource = referralSource || null;
+    const normalizedRepresentativeName =
+      normalizedReferralSource === 'representative' ? representativeName.trim() : null;
+    const normalizedInterestedServices = Array.isArray(interestedServices)
+      ? interestedServices
+      : Array.isArray(selectedServices)
+        ? selectedServices
+        : [];
 
     // Update user profile
     await User.findOneAndUpdate(
@@ -52,7 +74,9 @@ router.post('/onboarding', authMiddleware, roleMiddleware('student'), async (req
       { userId: req.user.userId },
       {
         interestedCountries: interestedCountries || [],
-        selectedServices: selectedServices || [],
+        interestedServices: normalizedInterestedServices,
+        referralSource: normalizedReferralSource,
+        representativeName: normalizedRepresentativeName,
         onboardingCompleted: true
       },
       { new: true }
@@ -70,7 +94,12 @@ router.post('/onboarding', authMiddleware, roleMiddleware('student'), async (req
       'student_onboarded',
       'student',
       studentId,
-      { interestedCountries, selectedServices },
+      {
+        interestedCountries,
+        interestedServices: normalizedInterestedServices,
+        referralSource: normalizedReferralSource,
+        representativeName: normalizedRepresentativeName
+      },
       req
     );
 
@@ -124,8 +153,12 @@ router.get('/profile', authMiddleware, roleMiddleware('student'), async (req, re
       studentId: student.studentId,
       userId: student.userId,
       interestedCountries: student.interestedCountries || [],
+      interestedServices: student.interestedServices || [],
       selectedServices: student.selectedServices || [],
       onboardingCompleted: student.onboardingCompleted,
+      interactionMode: student.interactionMode || 'student-counselor',
+      referralSource: student.referralSource || null,
+      representativeName: student.representativeName || null,
       // Education details
       age: student.age,
       currentEducationLevel: student.currentEducationLevel,
@@ -172,6 +205,8 @@ router.put('/profile', authMiddleware, roleMiddleware('student'), async (req, re
       lastName,
       phone,
       country,
+      referralSource,
+      representativeName,
       // Education details
       age,
       currentEducationLevel,
@@ -208,6 +243,17 @@ router.put('/profile', authMiddleware, roleMiddleware('student'), async (req, re
 
     // Update student profile
     const studentUpdateData = {};
+    if (referralSource !== undefined) studentUpdateData.referralSource = referralSource || null;
+    if (representativeName !== undefined) studentUpdateData.representativeName = representativeName || null;
+    if (studentUpdateData.referralSource === 'representative' && !studentUpdateData.representativeName?.trim()) {
+      return res.status(400).json({ error: 'Representative name is required' });
+    }
+    if (studentUpdateData.referralSource && studentUpdateData.referralSource !== 'representative') {
+      studentUpdateData.representativeName = null;
+    }
+    if (studentUpdateData.referralSource === 'representative' && studentUpdateData.representativeName) {
+      studentUpdateData.representativeName = studentUpdateData.representativeName.trim();
+    }
     if (age !== undefined) studentUpdateData.age = age ? parseInt(age) : null;
     if (currentEducationLevel !== undefined) studentUpdateData.currentEducationLevel = currentEducationLevel;
     if (fieldOfStudy !== undefined) studentUpdateData.fieldOfStudy = fieldOfStudy;
@@ -258,8 +304,11 @@ router.put('/profile', authMiddleware, roleMiddleware('student'), async (req, re
       studentId: student.studentId,
       userId: student.userId,
       interestedCountries: student.interestedCountries || [],
+      interestedServices: student.interestedServices || [],
       selectedServices: student.selectedServices || [],
       onboardingCompleted: student.onboardingCompleted,
+      referralSource: student.referralSource || null,
+      representativeName: student.representativeName || null,
       age: student.age,
       currentEducationLevel: student.currentEducationLevel,
       fieldOfStudy: student.fieldOfStudy,
@@ -364,7 +413,7 @@ router.post('/upload-image', authMiddleware, roleMiddleware('student'), async (r
 });
 
 // Upload document (transcripts, resume, etc.)
-router.post('/upload-document', authMiddleware, roleMiddleware('student'), async (req, res) => {
+router.post('/upload-document', authMiddleware, roleMiddleware('student'), enforceStudentInteractionMode, async (req, res) => {
   try {
     const { documentType } = req.body;
 
@@ -475,7 +524,7 @@ router.get('/documents', authMiddleware, roleMiddleware('student'), async (req, 
 });
 
 // Delete a document
-router.delete('/documents/:documentType', authMiddleware, roleMiddleware('student'), async (req, res) => {
+router.delete('/documents/:documentType', authMiddleware, roleMiddleware('student'), enforceStudentInteractionMode, async (req, res) => {
   try {
     const { documentType } = req.params;
 
@@ -528,7 +577,7 @@ router.delete('/documents/:documentType', authMiddleware, roleMiddleware('studen
 });
 
 // Apply for services
-router.post('/apply-services', authMiddleware, roleMiddleware('student'), async (req, res) => {
+router.post('/apply-services', authMiddleware, roleMiddleware('student'), enforceStudentInteractionMode, async (req, res) => {
   try {
     const { serviceIds } = req.body;
 

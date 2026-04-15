@@ -160,6 +160,52 @@ const serviceRequestSchema = new mongoose.Schema({
   cancelledAt: Date,
 
   // =============================================================================
+  // REPRESENTATIVE FIELDS
+  // =============================================================================
+
+  // Representative who referred or created this request
+  representativeId: {
+    type: String,
+    ref: 'User',
+    index: true
+  },
+
+  // Optional representative name for direct student applications (no representative account)
+  representativeName: {
+    type: String,
+    default: ''
+  },
+
+  // Representative level (1, 2, or 3)
+  representativeLevel: {
+    type: Number,
+    enum: [1, 2, 3, null],
+    default: null
+  },
+
+  // Commission percentage for representative on this request
+  commissionPercentage: {
+    type: Number,
+    min: 0,
+    max: 100,
+    default: 0
+  },
+
+  // Who created this service request
+  createdBy: {
+    type: String,
+    enum: ['student', 'rep3', null],
+    default: 'student'
+  },
+
+  // Interaction mode determines chat routing
+  interactionMode: {
+    type: String,
+    enum: ['student-counselor', 'rep-counselor', null],
+    default: null
+  },
+
+  // =============================================================================
   // AGENT-INITIATED SERVICE REQUEST FIELDS
   // =============================================================================
 
@@ -203,6 +249,8 @@ serviceRequestSchema.index({ assignedAgent: 1, status: 1, priority: -1, deadline
 serviceRequestSchema.index({ deadline: 1, status: 1 });
 serviceRequestSchema.index({ priority: -1, createdAt: -1 });
 serviceRequestSchema.index({ isAgentInitiated: 1, agentApprovalStatus: 1 });
+serviceRequestSchema.index({ representativeId: 1, status: 1 });
+serviceRequestSchema.index({ interactionMode: 1 });
 
 // Method to update status with history tracking
 serviceRequestSchema.methods.updateStatus = function(newStatus, changedBy, note = '') {

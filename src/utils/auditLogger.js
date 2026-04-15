@@ -6,6 +6,13 @@
 const AuditLog = require('../models/AuditLog');
 const { v4: uuidv4 } = require('uuid');
 
+const ENTITY_TYPE_ALIASES = {
+  serviceRequest: 'service_request',
+};
+
+const normalizeEntityType = entityType =>
+  ENTITY_TYPE_ALIASES[entityType] || entityType;
+
 /**
  * Create audit log entry with full state tracking
  * @param {Object} options - Audit options
@@ -33,12 +40,14 @@ const createAuditLog = async (options) => {
       req = null
     } = options;
 
+    const normalizedEntityType = normalizeEntityType(entityType);
+
     const log = new AuditLog({
       logId: uuidv4(),
       actorUserId,
       actorRole,
       action,
-      entityType,
+      entityType: normalizedEntityType,
       entityId,
       previousState,
       newState,
@@ -48,7 +57,7 @@ const createAuditLog = async (options) => {
       timestamp: new Date(),
       // Backward compatibility
       userId: actorUserId,
-      resourceType: entityType,
+      resourceType: normalizedEntityType,
       resourceId: entityId
     });
 
@@ -66,19 +75,21 @@ const createAuditLog = async (options) => {
  */
 const logAudit = async (userId, action, resourceType, resourceId, details, req) => {
   try {
+    const normalizedEntityType = normalizeEntityType(resourceType);
+
     const log = new AuditLog({
       logId: uuidv4(),
       actorUserId: userId,
       actorRole: 'system', // Legacy doesn't track role
       action,
-      entityType: resourceType,
+      entityType: normalizedEntityType,
       entityId: resourceId,
       details,
       ipAddress: req?.ip || req?.connection?.remoteAddress,
       userAgent: req?.get?.('user-agent'),
       // Backward compatibility fields
       userId,
-      resourceType,
+      resourceType: normalizedEntityType,
       resourceId
     });
     await log.save();

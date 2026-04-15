@@ -27,8 +27,14 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['student', 'super_admin', 'counselor', 'agent', 'editor'],
+    enum: ['student', 'super_admin', 'counselor', 'agent', 'editor', 'rep1', 'rep2', 'rep3'],
     default: 'student'
+  },
+  // Representative level (for rep1, rep2, rep3 roles)
+  representativeLevel: {
+    type: Number,
+    enum: [1, 2, 3, null],
+    default: null
   },
   phone: String,
   country: String,

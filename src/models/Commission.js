@@ -13,6 +13,12 @@ const commissionSchema = new mongoose.Schema({
     required: true,
     ref: 'User'
   },
+  // Representative level for commission calculation
+  representativeLevel: {
+    type: Number,
+    enum: [1, 2, 3, null],
+    default: null
+  },
   studentId: {
     type: String,
     required: true,

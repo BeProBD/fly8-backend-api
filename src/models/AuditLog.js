@@ -44,6 +44,7 @@ const auditLogSchema = new mongoose.Schema({
       'service_request_note_added',
       'service_request_completed',
       'service_request_cancelled',
+      'service_request_deleted',
       // Task lifecycle
       'task_created',
       'task_status_changed',

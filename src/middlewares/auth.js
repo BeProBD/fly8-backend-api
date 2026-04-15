@@ -104,6 +104,38 @@ const getRoleBasedFilter = (user, entityType) => {
           return {};
       }
 
+    case 'rep1':
+    case 'rep2':
+      // Rep Level 1 & 2: read-only access to their referred students' data
+      switch (entityType) {
+        case 'serviceRequest':
+          return { representativeId: user.userId };
+        case 'task':
+          return { _id: null }; // No task access for L1/L2
+        case 'notification':
+          return { recipientId: user.userId };
+        default:
+          return { representativeId: user.userId };
+      }
+
+    case 'rep3':
+      // Rep Level 3 (Partner): full operator of student accounts they created
+      switch (entityType) {
+        case 'serviceRequest':
+          return { representativeId: user.userId };
+        case 'task':
+          return {
+            $or: [
+              { assignedTo: user.userId },
+              { assignedBy: user.userId }
+            ]
+          };
+        case 'notification':
+          return { recipientId: user.userId };
+        default:
+          return {};
+      }
+
     default:
       return { _id: null }; // No access
   }
@@ -130,6 +162,9 @@ const canAccessResource = (user, resource, resourceType) => {
         return resource.assignedCounselor === user.userId ||
                resource.assignedAgent === user.userId;
       }
+      if (user.role === 'rep1' || user.role === 'rep2' || user.role === 'rep3') {
+        return resource.representativeId === user.userId;
+      }
       return false;
 
     case 'task':
@@ -139,6 +174,10 @@ const canAccessResource = (user, resource, resourceType) => {
       if (user.role === 'counselor' || user.role === 'agent') {
         return resource.assignedBy === user.userId;
       }
+      if (user.role === 'rep3') {
+        return resource.assignedTo === user.userId;
+      }
+      // rep1/rep2 have no task access
       return false;
 
     case 'student':
@@ -147,7 +186,13 @@ const canAccessResource = (user, resource, resourceType) => {
       }
       if (user.role === 'counselor' || user.role === 'agent') {
         return resource.assignedCounselor === user.userId ||
-               student.assignedAgent === user.userId;
+               resource.assignedAgent === user.userId;
+      }
+      if (user.role === 'rep1' || user.role === 'rep2') {
+        return resource.referredBy === user.userId;
+      }
+      if (user.role === 'rep3') {
+        return resource.createdByRep === user.userId;
       }
       return false;
 
@@ -166,7 +211,10 @@ const getDashboardUrl = (role) => {
     'student': '/student/dashboard',
     'counselor': '/counselor/dashboard',
     'agent': '/agent/dashboard',
-    'super_admin': '/admin/dashboard'
+    'super_admin': '/admin/dashboard',
+    'rep1': '/representative/dashboard',
+    'rep2': '/representative/dashboard',
+    'rep3': '/partner/dashboard'
   };
 
   return dashboardMap[role] || '/';

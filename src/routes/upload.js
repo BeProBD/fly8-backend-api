@@ -12,7 +12,8 @@ const {
   uploadTaskFiles,
   uploadServiceRequestDocument,
   deleteFile,
-  getSignedUploadParams
+  getSignedUploadParams,
+  downloadCloudinaryFile
 } = require('../controllers/uploadController');
 
 /**
@@ -75,5 +76,13 @@ router.get('/signed-params',
   authMiddleware,
   getSignedUploadParams
 );
+
+/**
+ * @route   GET /api/upload/download
+ * @desc    Redirect to a signed Cloudinary URL with attachment flag so legacy
+ *          /image/upload/*.pdf files can be downloaded past the PDF block.
+ * @access  Public (signed URL provides authorization)
+ */
+router.get('/download', downloadCloudinaryFile);
 
 module.exports = router;

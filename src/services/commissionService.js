@@ -305,6 +305,128 @@ async function createVASCommission(serviceRequest, triggeredBy) {
 }
 
 /**
+ * Default commission rates by representative level.
+ * Admin can override per-user via User.commissionPercentage.
+ */
+const REP_COMMISSION_RATES = {
+  rep1: 20,
+  rep2: 40,
+  rep3: 60 // configurable per-user
+};
+
+/**
+ * Determine commission rate for a given user, respecting:
+ * 1. Per-user override (User.commissionPercentage)
+ * 2. Role-based default (REP_COMMISSION_RATES)
+ * 3. Platform default from Settings
+ */
+function getCommissionRate(user, commissionSettings = {}) {
+  if (user.commissionPercentage && user.commissionPercentage > 0) {
+    return user.commissionPercentage; // Admin override
+  }
+  if (REP_COMMISSION_RATES[user.role]) {
+    return REP_COMMISSION_RATES[user.role];
+  }
+  return commissionSettings.defaultAgentCommission || 10;
+}
+
+/**
+ * Create commission for a representative when a service request completes.
+ * Only creates if the service request has a representativeId.
+ * @param {Object} serviceRequest - The completed ServiceRequest document
+ * @param {String} triggeredBy - userId of who triggered the status change
+ */
+async function createRepresentativeCommission(serviceRequest, triggeredBy) {
+  const repUserId = serviceRequest.representativeId;
+  if (!repUserId) return null;
+
+  // Idempotency: check if rep commission already exists
+  const existing = await Commission.findOne({
+    serviceRequestId: serviceRequest.serviceRequestId,
+    agentId: repUserId,
+    isDeleted: false
+  });
+  if (existing) {
+    console.log(`Rep commission already exists for SR ${serviceRequest.serviceRequestId}`);
+    return existing;
+  }
+
+  const rep = await User.findOne({ userId: repUserId }).lean();
+  if (!rep || !rep.isActive) return null;
+
+  const settings = await Settings.getSettings();
+  const commissionSettings = settings?.commission || {};
+  const paymentSettings = settings?.payment || {};
+
+  const commissionRate = getCommissionRate(rep, commissionSettings);
+
+  // Base amount from service fees
+  const serviceTypeKey = serviceTypeToFeeKey(serviceRequest.serviceType);
+  let baseAmount = 500;
+  if (paymentSettings.serviceFees && paymentSettings.serviceFees[serviceTypeKey]) {
+    const fee = paymentSettings.serviceFees[serviceTypeKey];
+    if (fee > 0) baseAmount = fee;
+  }
+
+  const amount = Math.round((baseAmount * commissionRate / 100) * 100) / 100;
+  const currency = commissionSettings.commissionCurrency || 'USD';
+  const autoApprove = commissionSettings.autoApproveCommissions || false;
+
+  const commission = new Commission({
+    commissionId: uuidv4(),
+    agentId: repUserId, // Commission model uses agentId for the earner
+    studentId: serviceRequest.studentId,
+    commissionType: 'VAS',
+    serviceRequestId: serviceRequest.serviceRequestId,
+    serviceType: serviceRequest.serviceType,
+    representativeLevel: serviceRequest.representativeLevel || null,
+    baseAmount,
+    percentage: commissionRate,
+    amount,
+    currency,
+    status: autoApprove ? 'approved' : 'pending',
+    description: `Representative commission for ${SERVICE_TYPE_NAMES[serviceRequest.serviceType] || serviceRequest.serviceType}`,
+    statusHistory: [{
+      status: autoApprove ? 'approved' : 'pending',
+      changedBy: 'system',
+      changedAt: new Date(),
+      note: `Representative (Level ${serviceRequest.representativeLevel || '?'}) commission at ${commissionRate}%`
+    }]
+  });
+
+  if (autoApprove) {
+    commission.approvedBy = 'system';
+    commission.approvedAt = new Date();
+  }
+
+  await commission.save();
+  await updateAgentEarnings(repUserId);
+
+  // Notify representative
+  try {
+    const notification = new Notification({
+      notificationId: uuidv4(),
+      recipientId: repUserId,
+      type: 'COMMISSION_EARNED',
+      title: 'New Commission Earned',
+      message: `You earned $${amount.toFixed(2)} commission for ${SERVICE_TYPE_NAMES[serviceRequest.serviceType] || 'service'}`,
+      relatedEntities: { commissionId: commission.commissionId }
+    });
+    await notification.save();
+    emitToUser(repUserId, 'new_notification', notification);
+  } catch (e) {
+    console.error('Rep commission notification error:', e.message);
+  }
+
+  logAudit(triggeredBy || 'system', 'rep_commission_created', 'commission', commission.commissionId, {
+    repUserId, amount, representativeLevel: serviceRequest.representativeLevel,
+    commissionRate, serviceRequestId: serviceRequest.serviceRequestId
+  });
+
+  return commission;
+}
+
+/**
  * Get agent wallet data (computed from commissions).
  */
 async function getAgentWallet(agentId) {
@@ -414,6 +536,9 @@ function serviceTypeToFeeKey(serviceType) {
 module.exports = {
   createApplicationCommission,
   createVASCommission,
+  createRepresentativeCommission,
+  getCommissionRate,
+  REP_COMMISSION_RATES,
   getAgentWallet,
   generateInvoiceNumber,
   updateAgentEarnings,

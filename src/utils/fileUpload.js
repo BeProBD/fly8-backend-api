@@ -71,7 +71,7 @@ const validateFile = (file) => {
 const uploadToCloudinary = async (file, options = {}) => {
   const {
     folder = 'fly8/uploads',
-    resourceType = 'auto',
+    resourceType: explicitResourceType,
     publicId = null
   } = options;
 
@@ -82,11 +82,29 @@ const uploadToCloudinary = async (file, options = {}) => {
       throw new Error(validation.error);
     }
 
+    // Route non-image files (PDF/DOCX/XLS/etc.) to 'raw' so Cloudinary
+    // serves them without the account-level "deliver PDFs as image" block
+    // that produces 401 on /image/upload/*.pdf URLs.
+    const resourceType = explicitResourceType
+      || (validation.category === 'image' ? 'image' : 'raw');
+
     const uploadOptions = {
       folder,
       resource_type: resourceType,
+      use_filename: true,
+      unique_filename: true,
       timeout: 120000
     };
+
+    if (resourceType === 'raw') {
+      // Preserve the original filename/extension in the delivered URL so
+      // browsers recognise the content-type on download.
+      const originalName = file.name || file.originalname || '';
+      if (originalName) {
+        uploadOptions.public_id = `${Date.now()}_${originalName.replace(/\s+/g, '_')}`;
+        uploadOptions.use_filename = false;
+      }
+    }
 
     if (publicId) {
       uploadOptions.public_id = publicId;
