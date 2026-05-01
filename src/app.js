@@ -74,8 +74,10 @@ const allowedOrigins = [
 
 // Matches any Vercel preview deployment for this project's own frontend apps.
 // Format: fly8-(marketing|dashboard)-frontend[-<hash>][-<slug>].vercel.app
-const isOwnVercelPreview = (origin) =>
-  /^https:\/\/fly8-(marketing|dashboard)-frontend(-[a-z0-9]+)*\.vercel\.app$/.test(origin);
+const isOwnVercelPreview = origin =>
+  /^https:\/\/fly8-(marketing|dashboard)-frontend(-[a-z0-9]+)*\.vercel\.app$/.test(
+    origin,
+  );
 
 const corsOptions = {
   origin: function (origin, callback) {
@@ -211,7 +213,7 @@ const connectDB = async () => {
         connectTimeoutMS: 30000,
         maxPoolSize: 10,
       })
-      .then(async (conn) => {
+      .then(async conn => {
         console.log('✅ MongoDB Connected Successfully');
         console.log(`   Database: ${DB_NAME}`);
         try {
@@ -277,6 +279,7 @@ const publicEventRoutes = require('./routes/public/events');
 const publicContactRoutes = require('./routes/public/contact');
 const publicSuccessStoryRoutes = require('./routes/public/successStories');
 const publicCmsEventRoutes = require('./routes/public/cmsEvents');
+const internRoutes = require('./routes/intern');
 
 // Admin Content Management Routes
 const adminUniversityRoutes = require('./routes/admin/universities');
@@ -325,7 +328,11 @@ app.use('/api/v1/public/contact', publicContactRoutes);
 app.use('/api/v1/public/success-stories', publicSuccessStoryRoutes);
 app.use('/api/v1/public/cms-events', publicCmsEventRoutes);
 app.use('/api/v1/public/offers', require('./routes/public/offers'));
-app.use('/api/v1/public/campaign-leads', require('./routes/public/campaignLeads'));
+app.use(
+  '/api/v1/public/campaign-leads',
+  require('./routes/public/campaignLeads'),
+);
+app.use('/api/v1/public/intern', internRoutes);
 
 // =============================================================================
 // AUTHENTICATION ROUTES
@@ -449,7 +456,7 @@ app.use((err, req, res, next) => {
     return res.status(err.statusCode).json({
       success: false,
       message: err.message,
-      code: err.code
+      code: err.code,
     });
   }
 
@@ -458,7 +465,7 @@ app.use((err, req, res, next) => {
     return res.status(403).json({
       success: false,
       message: 'CORS policy violation',
-      code: 'CORS_ERROR'
+      code: 'CORS_ERROR',
     });
   }
 
@@ -467,7 +474,7 @@ app.use((err, req, res, next) => {
     return res.status(400).json({
       success: false,
       message: err.message,
-      code: 'VALIDATION_ERROR'
+      code: 'VALIDATION_ERROR',
     });
   }
 
@@ -476,7 +483,7 @@ app.use((err, req, res, next) => {
     return res.status(401).json({
       success: false,
       message: 'Invalid token',
-      code: 'INVALID_TOKEN'
+      code: 'INVALID_TOKEN',
     });
   }
 
@@ -484,7 +491,7 @@ app.use((err, req, res, next) => {
     return res.status(401).json({
       success: false,
       message: 'Token expired',
-      code: 'TOKEN_EXPIRED'
+      code: 'TOKEN_EXPIRED',
     });
   }
 
@@ -493,17 +500,18 @@ app.use((err, req, res, next) => {
     return res.status(409).json({
       success: false,
       message: 'Duplicate entry',
-      code: 'DUPLICATE_ENTRY'
+      code: 'DUPLICATE_ENTRY',
     });
   }
 
   // Generic — never leak internal details in production
   res.status(err.status || 500).json({
     success: false,
-    message: process.env.NODE_ENV === 'production'
-      ? 'Internal server error'
-      : (err.message || 'Internal server error'),
-    code: 'INTERNAL_ERROR'
+    message:
+      process.env.NODE_ENV === 'production'
+        ? 'Internal server error'
+        : err.message || 'Internal server error',
+    code: 'INTERNAL_ERROR',
   });
 });
 
