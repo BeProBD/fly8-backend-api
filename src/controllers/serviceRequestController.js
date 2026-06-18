@@ -48,21 +48,25 @@ const createServiceRequest = async (req, res) => {
     }
 
     // Check if service request already exists for this service type
-    const existingRequest = await ServiceRequest.findOne({
-      studentId: req.student.studentId,
-      serviceType,
-      status: { $in: ['PENDING_ADMIN_ASSIGNMENT', 'ASSIGNED', 'IN_PROGRESS'] }
-    });
-
-    if (existingRequest) {
-      return res.status(400).json({
-        error: 'You already have an active request for this service',
-        existingRequest: {
-          serviceRequestId: existingRequest.serviceRequestId,
-          status: existingRequest.status,
-          appliedAt: existingRequest.appliedAt
-        }
+    // Exception: APPLICATION_ASSISTANCE allows multiple active requests so a
+    // student can apply to multiple university programs in parallel.
+    if (serviceType !== 'APPLICATION_ASSISTANCE') {
+      const existingRequest = await ServiceRequest.findOne({
+        studentId: req.student.studentId,
+        serviceType,
+        status: { $in: ['PENDING_ADMIN_ASSIGNMENT', 'ASSIGNED', 'IN_PROGRESS'] }
       });
+
+      if (existingRequest) {
+        return res.status(400).json({
+          error: 'You already have an active request for this service',
+          existingRequest: {
+            serviceRequestId: existingRequest.serviceRequestId,
+            status: existingRequest.status,
+            appliedAt: existingRequest.appliedAt
+          }
+        });
+      }
     }
 
     // Create service request
@@ -394,6 +398,25 @@ const assignServiceRequest = async (req, res) => {
     serviceRequest.assignedAt = new Date();
 
     await serviceRequest.save();
+
+    // Keep the UniversityApplication sidecar in sync (Apply-University only).
+    // No-op if no UA exists, so other 7 services are unaffected.
+    if (serviceRequest.serviceType === 'APPLICATION_ASSISTANCE') {
+      try {
+        const UniversityApplication = require('../models/UniversityApplication');
+        await UniversityApplication.updateOne(
+          { serviceRequestId: serviceRequest.serviceRequestId },
+          {
+            $set: {
+              assignedCounselor: serviceRequest.assignedCounselor || null,
+              assignedAgent: serviceRequest.assignedAgent || null,
+            },
+          },
+        );
+      } catch (syncErr) {
+        console.error('UA sidecar sync error (assign):', syncErr);
+      }
+    }
 
     // Audit log: Service request assigned
     await logServiceRequestEvent(req, 'service_request_assigned', serviceRequest, previousStatus);

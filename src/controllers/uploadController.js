@@ -363,41 +363,160 @@ const getSignedUploadParams = async (req, res) => {
 };
 
 /**
- * Proxy/redirect a Cloudinary URL as a signed attachment.
- * Needed because legacy uploads went to `/image/upload/*.pdf`, which Cloudinary
- * accounts block by default (HTTP 401). Generating a signed download URL
- * bypasses that restriction and forces an attachment download.
+ * Serve a Cloudinary file for viewing or downloading.
+ *
+ * Root causes this solves:
+ *  1. Cloudinary `raw` public_ids INCLUDE the file extension (e.g. "file.pdf"),
+ *     so it must NOT be stripped when building download URLs.
+ *  2. For `image` resource type the extension is separate (format field).
+ *  3. Streaming via https.get() returns 401 because Cloudinary blocks requests
+ *     with no User-Agent; we add one and only use it as a fallback.
+ *
+ * Query params:
+ *   url   – stored Cloudinary secure_url (required)
+ *   name  – suggested filename for Content-Disposition (optional)
+ *   mode  – "view" = inline preview | anything else = forced download
  */
-const downloadCloudinaryFile = async (req, res) => {
-  try {
-    const { url, name } = req.query;
-    if (!url) return res.status(400).json({ error: 'url query param required' });
+const downloadCloudinaryFile = (req, res) => {
+  const { url, name, mode } = req.query;
+  if (!url) return res.status(400).json({ error: 'url query param required' });
 
-    const match = String(url).match(
-      /res\.cloudinary\.com\/[^/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+?)(?:\.([a-zA-Z0-9]+))?$/
-    );
+  let parsedUrl;
+  try { parsedUrl = new URL(url); }
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
 
-    if (!match) {
-      return res.redirect(url);
+  if (!parsedUrl.hostname.endsWith('cloudinary.com')) {
+    return res.redirect(302, url);
+  }
+
+  const inline = mode === 'view';
+  const filename = name || parsedUrl.pathname.split('/').pop() || 'file';
+
+  // ── SHARED: parse public_id ────────────────────────────────────────────────
+  // Works for both view and download. Must be extracted before branching.
+  const pathMatch = parsedUrl.pathname.match(
+    /^\/[^/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+)$/
+  );
+  if (!pathMatch) return res.redirect(302, url);
+
+  const resourceType = pathMatch[1];
+  const fullPath = decodeURIComponent(pathMatch[2]);
+
+  // For `raw` uploads the extension is PART of the public_id in Cloudinary.
+  // For `image`/`video` the extension is the format field (stored separately).
+  let publicId, format;
+  if (resourceType === 'raw') {
+    publicId = fullPath;
+    format = '';
+  } else {
+    const dot = fullPath.lastIndexOf('.');
+    if (dot > 0 && fullPath.length - dot <= 5) {
+      publicId = fullPath.slice(0, dot);
+      format = fullPath.slice(dot + 1);
+    } else {
+      publicId = fullPath;
+      format = '';
+    }
+  }
+
+  // ── VIEW MODE ──────────────────────────────────────────────────────────────
+  // Generate a signed Cloudinary delivery URL, then proxy the bytes through
+  // our backend. This avoids the browser CORS block that occurs when the
+  // frontend fetch() follows a redirect to res.cloudinary.com (Cloudinary's
+  // CDN does not serve Access-Control-Allow-Origin for signed delivery URLs).
+  // Proxying also keeps the Blob URL approach intact so the iframe is
+  // same-origin and bypasses any X-Frame-Options restrictions.
+  if (inline) {
+    let fetchUrl;
+    try {
+      fetchUrl = cloudinary.url(publicId, {
+        resource_type: resourceType,
+        type: 'upload',
+        sign_url: true,
+        secure: true,
+        expires_at: Math.floor(Date.now() / 1000) + 600
+      });
+    } catch (err) {
+      console.error('Cloudinary view sign error:', err.message);
+      fetchUrl = url; // fallback: try the original URL
     }
 
-    const resourceType = match[1];
-    const publicId = decodeURIComponent(match[2]);
-    const format = match[3] || undefined;
+    const fetchParsed = new URL(fetchUrl);
+    const proto = fetchParsed.protocol === 'https:' ? require('https') : require('http');
 
-    const signedUrl = cloudinary.utils.private_download_url(publicId, format, {
-      resource_type: resourceType,
-      type: 'upload',
-      attachment: name || true,
-      expires_at: Math.floor(Date.now() / 1000) + 60 * 10
+    const upstreamReq = proto.get(fetchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Fly8/2.0; +https://fly8.study)',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity'
+      },
+      timeout: 30000 // 30s upstream timeout — prevents hung requests
+    }, (upstream) => {
+      if (upstream.statusCode !== 200) {
+        upstream.resume();
+        if (!res.headersSent) return res.status(upstream.statusCode || 502).json({ error: 'File not available from storage', status: upstream.statusCode });
+        return;
+      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Content-Type', upstream.headers['content-type'] || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+      if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      upstream.pipe(res);
     });
 
-    return res.redirect(signedUrl);
-  } catch (error) {
-    console.error('Download proxy error:', error);
-    if (req.query.url) return res.redirect(req.query.url);
-    return res.status(500).json({ error: 'Failed to generate download URL' });
+    upstreamReq.on('timeout', () => {
+      upstreamReq.destroy();
+      if (!res.headersSent) res.status(504).json({ error: 'Storage timeout' });
+    });
+
+    upstreamReq.on('error', (err) => {
+      console.error('Cloudinary proxy error:', err.message);
+      if (!res.headersSent) res.status(502).json({ error: 'Failed to fetch file from storage' });
+    });
+
+    return;
   }
+
+  // ── DOWNLOAD MODE ──────────────────────────────────────────────────────────
+
+  try {
+    const downloadUrl = cloudinary.utils.private_download_url(publicId, format, {
+      resource_type: resourceType,
+      type: 'upload',
+      expires_at: Math.floor(Date.now() / 1000) + 600,
+      attachment: filename
+    });
+    return res.redirect(302, downloadUrl);
+  } catch (signErr) {
+    console.error('Cloudinary sign error, falling back to stream:', signErr.message);
+  }
+
+  // ── STREAM FALLBACK ────────────────────────────────────────────────────────
+  // Only reached if private_download_url throws. Adds a User-Agent so
+  // Cloudinary doesn't block the server-side request.
+  const protocol = parsedUrl.protocol === 'https:' ? require('https') : require('http');
+
+  protocol.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; Fly8/2.0; +https://fly8.study)',
+      'Accept': '*/*',
+      'Accept-Encoding': 'identity'
+    }
+  }, (upstream) => {
+    if (upstream.statusCode !== 200) {
+      upstream.resume();
+      if (!res.headersSent) return res.redirect(302, url); // last resort
+      return;
+    }
+    res.setHeader('Content-Type', upstream.headers['content-type'] || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    upstream.pipe(res);
+  }).on('error', () => {
+    if (!res.headersSent) res.redirect(302, url);
+  });
 };
 
 module.exports = {

@@ -250,7 +250,7 @@ const generateEmailTemplate = (options) => {
       <p>
         This email was sent by Fly8 - International Student Services Platform<br>
         <a href="${DASHBOARD_URL}">Dashboard</a> |
-        <a href="https://fly8.global">Website</a> |
+        <a href="https://fly8.study">Website</a> |
         <a href="mailto:support@fly8.global">Support</a>
       </p>
       <p style="margin-top: 15px; font-size: 12px;">

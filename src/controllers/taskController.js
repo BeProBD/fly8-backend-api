@@ -24,7 +24,8 @@ const createTask = async (req, res) => {
       description,
       instructions,
       priority,
-      dueDate
+      dueDate,
+      metadata
     } = req.body;
 
     if (!serviceRequestId || !taskType || !title || !description) {
@@ -79,7 +80,8 @@ const createTask = async (req, res) => {
       assignedBy: req.user.userId,
       status: 'PENDING',
       priority: priority || 'MEDIUM',
-      dueDate: dueDate ? new Date(dueDate) : null
+      dueDate: dueDate ? new Date(dueDate) : null,
+      metadata: metadata && typeof metadata === 'object' ? metadata : {}
     });
 
     // Add initial status to history

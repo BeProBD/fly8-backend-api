@@ -22,7 +22,7 @@ const VALID_TRANSITIONS = {
 const ROLE_PERMISSIONS = {
   super_admin: ['ASSIGNED', 'IN_PROGRESS', 'WAITING_STUDENT', 'ON_HOLD', 'COMPLETED', 'CANCELLED'],
   counselor:   ['IN_PROGRESS', 'WAITING_STUDENT', 'ON_HOLD', 'COMPLETED', 'CANCELLED'],
-  agent:       ['IN_PROGRESS', 'WAITING_STUDENT', 'ON_HOLD', 'COMPLETED', 'CANCELLED'],
+  agent:       ['IN_PROGRESS', 'WAITING_STUDENT', 'ON_HOLD', 'CANCELLED'],
   student:     ['CANCELLED'],
   rep3:        ['CANCELLED']
 };

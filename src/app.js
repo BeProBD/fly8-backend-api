@@ -51,10 +51,11 @@ cloudinaryConnect();
 // CORS CONFIGURATION - Cross-subdomain support for fly8.com
 // =============================================================================
 const allowedOrigins = [
-  // Production domains
-  'https://fly8.global',
-  'https://www.fly8.global',
-  'https://app.fly8.global',
+  // Production domains (NEW — .study)
+  'https://fly8.study',
+  'https://www.fly8.study',
+  'https://app.fly8.study',
+
   // Vercel deployments
   'https://fly8-marketing-frontend.vercel.app',
   'https://fly8-dashboard-frontend.vercel.app',
@@ -269,6 +270,7 @@ const settingsRoutes = require('./routes/settings');
 const universitiesRoutes = require('./routes/universities');
 const dashboardRoutes = require('./routes/dashboard');
 const admissionsRoutes = require('./routes/admissions');
+const universityApplicationRoutes = require('./routes/universityApplications');
 
 // Marketing Routes (Public - No Auth Required)
 const publicUniversityRoutes = require('./routes/public/universities');
@@ -345,6 +347,7 @@ app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/students', studentRoutes);
 app.use('/api/v1/services', serviceRoutes);
 app.use('/api/v1/service-requests', serviceRequestRoutes);
+app.use('/api/v1/university-applications', universityApplicationRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/counselors', counselorRoutes);
 app.use('/api/v1/agents', agentRoutes);

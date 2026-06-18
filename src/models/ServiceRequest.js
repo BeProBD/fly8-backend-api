@@ -311,10 +311,8 @@ serviceRequestSchema.methods.updateProgress = function(newProgress, changedBy, n
     note
   });
 
-  // Auto-complete if progress reaches 100
-  if (this.progress === 100 && this.status !== 'COMPLETED') {
-    this.updateStatus('COMPLETED', changedBy, 'Auto-completed: progress reached 100%');
-  }
+  // Note: reaching 100% does NOT auto-complete the service request.
+  // Only a counselor can explicitly mark a service request COMPLETED.
 };
 
 module.exports = mongoose.model('ServiceRequest', serviceRequestSchema);

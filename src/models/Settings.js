@@ -16,7 +16,7 @@ const platformProfileSchema = new mongoose.Schema({
   supportEmail: { type: String, default: 'support@fly8.global' },
   supportPhone: { type: String, default: '' },
   address: { type: String, default: '' },
-  website: { type: String, default: 'https://fly8.global' },
+  website: { type: String, default: 'https://fly8.study' },
   socialLinks: {
     facebook: { type: String, default: '' },
     twitter: { type: String, default: '' },

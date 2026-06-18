@@ -161,7 +161,8 @@ const taskSchemas = {
     }),
     instructions: Joi.string().max(5000).allow('').optional(),
     priority: Joi.string().valid('LOW', 'MEDIUM', 'HIGH', 'URGENT').default('MEDIUM'),
-    dueDate: Joi.date().iso().optional()
+    dueDate: Joi.date().iso().optional(),
+    metadata: Joi.object().unknown(true).optional()
   }),
 
   submit: Joi.object({
